@@ -1,0 +1,4 @@
+colpali-engine
+pdf2image
+Pillow
+qdrant-client>=1.12.0
