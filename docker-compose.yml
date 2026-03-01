@@ -1,0 +1,77 @@
+services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    volumes:
+      - ollama:/root/.ollama
+    ports:
+      - "11434:11434"
+    restart: unless-stopped
+
+  pipelines:
+    build: ./pipelines
+    # image: ghcr.io/open-webui/pipelines:main
+    container_name: open-webui-pipelines
+    ports:
+      - "9099:9099"
+    environment:
+      - PIPELINES_API_KEY=0p3n-w3bu!
+      - PIPELINES_REQUIREMENTS_PATH=/app/pipelines/requirements.txt
+      - OLLAMA_BASE_URL=http://ollama:11434
+      - QDRANT_URL=http://qdrant:6333
+      - VLM_MODEL=qwen2.5vl:latest
+      - OPENROUTER_API_KEY=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
+      - OPENROUTER_MODEL=google/gemini-2.0-flash-001
+      - TARGET_KNOWLEDGE=my_docs
+      - PYTHONUNBUFFERED=1 
+    volumes:
+      - ./pipelines:/app/pipelines
+      - ./my-pdfs:/app/downloads
+      - hf-cache:/root/.cache/huggingface
+
+    depends_on:
+      - ollama
+      - qdrant
+    restart: unless-stopped
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: qdrant
+    ports:
+      - "6333:6333"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    restart: unless-stopped
+
+  image-server:
+    image: python:3.11-alpine
+    command: python -m http.server 80 -d /data
+    volumes:
+      - ./pipelines/cache/images:/data:ro
+    ports:
+      - "8081:80"
+    restart: unless-stopped
+
+  open-webui:
+    build: .
+    container_name: open-webui
+    volumes:
+      - open-webui:/app/backend/data
+    depends_on:
+      - ollama
+      - pipelines
+    ports:
+      - "3000:8080"
+    environment:
+      - OLLAMA_BASE_URL=http://ollama:11434
+      - PIPELINES_BASE_URL=http://pipelines:9099
+      - PIPELINES_API_KEY=0p3n-w3bu!
+    restart: unless-stopped
+
+volumes:
+  ollama:
+  open-webui:
+  qdrant_data:
+  pipelines:
+  hf-cache:
+  pip-cache:
