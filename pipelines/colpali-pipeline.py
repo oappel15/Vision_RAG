@@ -6,7 +6,7 @@ license: MIT
 description: Visual RAG pipeline using ColQwen2 multi-vector MaxSim + Qdrant + OpenRouter VLM.
 """
 
-import os, json, base64, io, logging, pathlib, hashlib
+import os, json, base64, io, logging, pathlib, hashlib, re
 from typing import List, Optional
 
 import torch
@@ -255,23 +255,23 @@ class Pipeline:
 
     # ── VLM call via OpenRouter ──────────────────────────────────────
 
-    def _call_vlm(self, query: str, hits) -> str:
+    def _call_vlm(self, query: str, hits) -> tuple:
         import requests as _req
 
         api_key = self.valves.OPENROUTER_API_KEY
         model = self.valves.OPENROUTER_MODEL
         if not api_key:
-            return "Error: OPENROUTER_API_KEY not set."
+            return "Error: OPENROUTER_API_KEY not set.", set()
 
         content_parts = [{"type": "text", "text": query}]
-        for hit in hits:
+        for i, hit in enumerate(hits, 1):
             img_filename = hit.payload.get("image_filename", "")
             src = hit.payload.get("source", "?")
             pg = hit.payload.get("page_number", "?")
             if img_filename:
                 img_b64 = self._load_page_image_b64(img_filename)
                 content_parts.append(
-                    {"type": "text", "text": f"[Page {pg} from {src}]"}
+                    {"type": "text", "text": f"[REF:{i}] Page {pg} from {src}"}
                 )
                 content_parts.append({
                     "type": "image_url",
@@ -291,12 +291,12 @@ class Pipeline:
                         "role": "system",
                         "content": (
                             "You are a helpful document assistant. You are given page "
-                            "images retrieved from the user's documents. Answer the "
-                            "question using information visible in these pages. "
-                            "Cite page numbers. If the pages only partially answer "
-                            "the question, share what you can find and note what's "
-                            "missing. Do NOT say 'I cannot find' unless the pages "
-                            "are truly irrelevant."
+                            "images retrieved from the user's documents, each labeled [REF:N]. "
+                            "Answer the question using only information visible in these pages. "
+                            "You MUST cite every claim inline using [REF:N] "
+                            "(e.g. 'Revenue was $5B [REF:1].'). "
+                            "Only cite pages you actually used. "
+                            "If a page is irrelevant, do not cite it."
                         ),
                     },
                     {"role": "user", "content": content_parts},
@@ -306,8 +306,17 @@ class Pipeline:
             timeout=120,
         )
         resp.raise_for_status()
-        result = resp.json()
-        return result["choices"][0]["message"]["content"]
+        answer = resp.json()["choices"][0]["message"]["content"]
+
+        # Parse which REF indices were cited (1-based → 0-based)
+        cited = {int(m) - 1 for m in re.findall(r'\[REF:(\d+)\]', answer)}
+
+        # Replace [REF:N] with [Page X] using actual page numbers
+        for i, hit in enumerate(hits, 1):
+            pg = hit.payload.get("page_number", "?")
+            answer = answer.replace(f"[REF:{i}]", f"[Page {pg}]")
+
+        return answer, cited
 
     # ── main entry ───────────────────────────────────────────────────
 
@@ -338,12 +347,18 @@ class Pipeline:
                     f"score={h.score:.4f}"
                 )
 
-            answer = self._call_vlm(query, hits)
+            answer, cited_indices = self._call_vlm(query, hits)
 
             # ── Source thumbnails via image-server ────────────────────
             if self.valves.SHOW_SOURCE_PAGES:
+                cited_hits = [hits[i] for i in sorted(cited_indices) if i < len(hits)]
+                if not cited_hits:
+                    cited_hits = hits  # fallback if model didn't use REF format
                 answer += "\n\n---\n\n**📄 Source Pages:**\n\n"
-                for hit in hits:
+                headers = []
+                divider = []
+                images = []
+                for hit in cited_hits:
                     img_filename = hit.payload.get("image_filename", "")
                     source = hit.payload.get("source", "unknown")
                     page = hit.payload.get("page_number", "?")
@@ -353,11 +368,15 @@ class Pipeline:
                         thumb_filename = self._make_thumbnail_file(img_filename)
                         full_url = f"{self.valves.IMAGE_SERVER_URL}/{img_filename}"
                         thumb_url = f"{self.valves.IMAGE_SERVER_URL}/{thumb_filename}"
-                        answer += (
-                            f"[![Page {page} - {source} ({score:.2f})]"
-                            f"({thumb_url})]"
-                            f"({full_url})\n\n"
-                        )
+                        headers.append(f"p{page} · {source} ({score:.2f})")
+                        divider.append(":---:")
+                        images.append(f"[![p{page}]({thumb_url})]({full_url})")
+                if images:
+                    answer += (
+                        "| " + " | ".join(headers) + " |\n"
+                        "| " + " | ".join(divider) + " |\n"
+                        "| " + " | ".join(images)  + " |\n\n"
+                    )
 
             return answer
 
