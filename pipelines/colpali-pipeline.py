@@ -317,7 +317,7 @@ class Pipeline:
             img_filename = hit.payload.get("image_filename", "")
             full_url = f"{self.valves.IMAGE_SERVER_URL}/{img_filename}" if img_filename else ""
             if full_url:
-                answer = answer.replace(f"[REF:{i}]", f"[Page {pg}]({full_url})")
+                answer = answer.replace(f"[REF:{i}]", f"[\\[Page {pg}\\]]({full_url})")
             else:
                 answer = answer.replace(f"[REF:{i}]", f"Page {pg}")
 
