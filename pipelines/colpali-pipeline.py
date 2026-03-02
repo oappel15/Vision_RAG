@@ -311,10 +311,15 @@ class Pipeline:
         # Parse which REF indices were cited (1-based → 0-based)
         cited = {int(m) - 1 for m in re.findall(r'\[REF:(\d+)\]', answer)}
 
-        # Replace [REF:N] with [Page X] using actual page numbers
+        # Replace [REF:N] with a linked [Page X] pointing to the full image
         for i, hit in enumerate(hits, 1):
             pg = hit.payload.get("page_number", "?")
-            answer = answer.replace(f"[REF:{i}]", f"[Page {pg}]")
+            img_filename = hit.payload.get("image_filename", "")
+            full_url = f"{self.valves.IMAGE_SERVER_URL}/{img_filename}" if img_filename else ""
+            if full_url:
+                answer = answer.replace(f"[REF:{i}]", f"[Page {pg}]({full_url})")
+            else:
+                answer = answer.replace(f"[REF:{i}]", f"Page {pg}")
 
         return answer, cited
 
