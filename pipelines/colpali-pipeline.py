@@ -139,6 +139,8 @@ class Pipeline:
     # ── indexing ─────────────────────────────────────────────────────
 
     def _index_local_pdfs(self):
+        from pdf2image import pdfinfo_from_path
+
         collection = self.valves.COLLECTION_NAME
         pdf_dir = pathlib.Path(self.valves.PDF_DIR)
         pdfs = sorted(pdf_dir.glob("*.pdf"))
@@ -155,17 +157,20 @@ class Pipeline:
                 self.qdrant.delete_collection(collection)
             except Exception:
                 pass
-            state = {"schema_version": SCHEMA_VERSION, "indexed_files": []}
+            state = {"schema_version": SCHEMA_VERSION, "indexed_files": [], "file_progress": {}}
             self._save_state(state)
 
         indexed = set(state.get("indexed_files", []))
+        file_progress = state.get("file_progress", {})
+
+        # Include both unstarted and partially-indexed files
         to_index = [p for p in pdfs if p.name not in indexed]
 
         if not to_index:
             log.info("All PDFs already indexed – skipping")
             return
 
-        log.info(f"Found {len(to_index)} new PDFs to index")
+        log.info(f"Found {len(to_index)} PDFs to index or resume")
 
         # ── Create collection with MULTI-VECTOR MaxSim ──────────────
         try:
@@ -189,50 +194,63 @@ class Pipeline:
         global_page_id = self.qdrant.get_collection(collection).points_count
 
         for pdf_file in to_index:
-            log.info(f"  Indexing {pdf_file.name} …")
-            global_page_id = self._ingest(pdf_file.name, collection, global_page_id)
+            # Resume from the last completed page, or start from 1
+            start_page = file_progress.get(pdf_file.name, 0) + 1
+            log.info(f"  Indexing {pdf_file.name} (from page {start_page}) …")
+            global_page_id = self._ingest(pdf_file.name, collection, global_page_id, start_page)
             indexed.add(pdf_file.name)
             state["indexed_files"] = list(indexed)
             state["schema_version"] = SCHEMA_VERSION
+            state.get("file_progress", {}).pop(pdf_file.name, None)
             self._save_state(state)
 
         log.info("✓ All PDFs indexed")
 
-    def _ingest(self, filename: str, collection: str, start_id: int) -> int:
+    def _ingest(self, filename: str, collection: str, start_id: int, start_page: int = 1) -> int:
+        from pdf2image import pdfinfo_from_path
+
         pdf_path = pathlib.Path(self.valves.PDF_DIR) / filename
-        pages = convert_from_path(str(pdf_path), dpi=200)
+        total_pages = pdfinfo_from_path(str(pdf_path))["Pages"]
+        log.info(f"    {filename}: {total_pages} total pages")
 
-        points = []
-        for i, page_img in enumerate(pages):
-            page_img = page_img.convert("RGB")
+        state = self._load_state()
+        if "file_progress" not in state:
+            state["file_progress"] = {}
 
-            # Save image to filesystem (not Qdrant payload)
-            img_filename = self._save_page_image(page_img, filename, i + 1)
+        pid = start_id
+        for page_num in range(start_page, total_pages + 1):
+            # Convert one page at a time to avoid loading the full PDF into memory
+            page_img = convert_from_path(
+                str(pdf_path), dpi=200, first_page=page_num, last_page=page_num
+            )[0].convert("RGB")
 
-            # ── MULTI-VECTOR embeddings (all patch tokens) ──────────
+            img_filename = self._save_page_image(page_img, filename, page_num)
+
             batch = self.processor.process_images([page_img])
             with torch.no_grad():
                 emb = self.model(**batch)
 
-            multi_vec = emb[0].tolist()   # shape: (num_patches, dim)
+            multi_vec = emb[0].tolist()
+            del page_img, batch, emb  # free memory immediately
 
-            pid = start_id + i
-            points.append(
-                PointStruct(
-                    id=pid,
-                    vector=multi_vec,       # ← ALL patch vectors
-                    payload={
-                        "source": filename,
-                        "page_number": i + 1,
-                        "image_filename": img_filename,
-                    },
-                )
-            )
-            log.info(f"    page {i+1}/{len(pages)}  id={pid}  patches={len(multi_vec)}")
+            self.qdrant.upsert(collection, [PointStruct(
+                id=pid,
+                vector=multi_vec,
+                payload={
+                    "source": filename,
+                    "page_number": page_num,
+                    "image_filename": img_filename,
+                },
+            )])
 
-        for point in points:
-            self.qdrant.upsert(collection, [point])
-        return start_id + len(pages)
+            log.info(f"    page {page_num}/{total_pages}  id={pid}  patches={len(multi_vec)}")
+            pid += 1
+
+            # Checkpoint after every page so we can resume on crash
+            state["file_progress"][filename] = page_num
+            self._save_state(state)
+
+        return pid
 
     # ── search with MULTI-VECTOR MaxSim ──────────────────────────────
 
