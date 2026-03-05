@@ -33,7 +33,7 @@ class Pipeline:
         QDRANT_PORT: int = 6333
         PDF_DIR: str = "/app/downloads"
         COLLECTION_NAME: str = "target_knowledge"
-        TOP_K: int = 5
+        TOP_K: int = 8
         SCORE_THRESHOLD: float = 0.0
         OPENROUTER_API_KEY: str = ""
         OPENROUTER_MODEL: str = "qwen/qwen3-vl-30b-a3b-instruct"
@@ -308,11 +308,16 @@ class Pipeline:
                     {
                         "role": "system",
                         "content": (
-                            "You are a helpful document assistant. You are given page "
-                            "images retrieved from the user's documents, each labeled [REF:N]. "
+                            "You are a helpful document assistant specializing in technical "
+                            "documents such as wiring diagrams, schematics, and manuals. "
+                            "You are given page images retrieved from the user's documents, "
+                            "each labeled [REF:N]. "
                             "Answer the question using only information visible in these pages. "
                             "You MUST cite every claim inline using [REF:N] "
-                            "(e.g. 'Revenue was $5B [REF:1].'). "
+                            "(e.g. 'Power flows through fuse F53 [REF:2].'). "
+                            "When tracing paths, circuits, or flows that span multiple pages, "
+                            "explicitly connect the information across pages in sequence to "
+                            "build a complete end-to-end answer. "
                             "Only cite pages you actually used. "
                             "If a page is irrelevant, do not cite it."
                         ),
@@ -326,18 +331,16 @@ class Pipeline:
         resp.raise_for_status()
         answer = resp.json()["choices"][0]["message"]["content"]
 
-        # Parse which REF indices were cited (1-based → 0-based)
-        cited = {int(m) - 1 for m in re.findall(r'\[REF:(\d+)\]', answer)}
+        # Parse which REF indices were cited (1-based → 0-based), tolerant of spacing/case
+        cited = {int(m) - 1 for m in re.findall(r'\[REF\s*:\s*(\d+)\]', answer, re.IGNORECASE)}
 
-        # Replace [REF:N] with a linked [Page X] pointing to the full image
+        # Replace [REF:N] variants with a linked [Page X] pointing to the full image
         for i, hit in enumerate(hits, 1):
             pg = hit.payload.get("page_number", "?")
             img_filename = hit.payload.get("image_filename", "")
             full_url = f"{self.valves.IMAGE_SERVER_URL}/{img_filename}" if img_filename else ""
-            if full_url:
-                answer = answer.replace(f"[REF:{i}]", f"**[\\[Page {pg}\\]]({full_url})**")
-            else:
-                answer = answer.replace(f"[REF:{i}]", f"Page {pg}")
+            replacement = f"**[\\[Page {pg}\\]]({full_url})**" if full_url else f"Page {pg}"
+            answer = re.sub(rf'\[REF\s*:\s*{i}\]', replacement, answer, flags=re.IGNORECASE)
 
         return answer, cited
 
