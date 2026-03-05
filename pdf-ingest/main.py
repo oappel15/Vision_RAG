@@ -61,12 +61,31 @@ def get_status():
     return JSONResponse({})
 
 
+@app.post("/cancel")
+def cancel_indexing():
+    try:
+        requests.post(
+            f"{PIPELINES_URL}/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {PIPELINES_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": PIPELINE_MODEL,
+                "messages": [{"role": "user", "content": "__cancel_index__"}],
+            },
+            timeout=5,
+        )
+    except Exception:
+        pass
+    return {"status": "cancel_requested"}
+
+
 @app.delete("/delete/{filename}")
 def delete_pdf(filename: str):
     pdf_path = PDF_DIR / filename
-    if not pdf_path.exists():
-        raise HTTPException(status_code=404, detail="File not found.")
-    pdf_path.unlink()
+    if pdf_path.exists():
+        pdf_path.unlink()
 
     if STATE_FILE.exists():
         with open(STATE_FILE) as f:
@@ -313,9 +332,28 @@ def ui():
       transition: width .5s ease;
       width: 0%;
     }
+    .progress-footer {
+      display: flex; align-items: center; justify-content: space-between; margin-top: 6px;
+    }
     .progress-pages {
       font-size: 12px; color: var(--text-muted);
     }
+    #cancelBtn {
+      background: transparent;
+      border: 1px solid var(--border);
+      color: var(--text-muted);
+      border-radius: var(--radius-sm);
+      padding: 4px 12px;
+      font-size: 12px;
+      cursor: pointer;
+      transition: background .15s, color .15s, border-color .15s;
+    }
+    #cancelBtn:hover {
+      background: var(--red-bg);
+      color: var(--red);
+      border-color: rgba(248,81,73,.3);
+    }
+    #cancelBtn:disabled { opacity: .4; cursor: default; }
 
     .idle-badge {
       display: inline-flex; align-items: center; gap: 6px;
@@ -425,7 +463,10 @@ def ui():
         <div class="progress-track">
           <div class="progress-bar" id="progBar"></div>
         </div>
-        <div class="progress-pages" id="progPages"></div>
+        <div class="progress-footer">
+          <div class="progress-pages" id="progPages"></div>
+          <button id="cancelBtn" onclick="cancelIndexing()">✕ Cancel</button>
+        </div>
       </div>
       <div id="idleWrap"><div class="idle-badge">● Idle — all documents indexed</div></div>
     </div>
@@ -491,6 +532,8 @@ def ui():
         document.getElementById('selectedFile').textContent = '';
         document.getElementById('uploadBtnLabel').textContent = 'Select a file first';
         document.getElementById('uploadBtnIcon').textContent = '⬆';
+        // Show queued state immediately — don't wait for next poll
+        showQueued(d.filename);
       } else {
         toast(`Error: ${d.detail}`, 'err');
         btn.disabled = false;
@@ -509,13 +552,46 @@ def ui():
   // ── Delete ─────────────────────────────────────────────────────────
   async function deletePdf(filename) {
     if (!confirm(`Remove "${filename}" from the index and delete from disk?`)) return;
+    // Optimistic: remove from DOM immediately without waiting for API or next poll
+    const li = document.querySelector(`li[data-file="${CSS.escape(filename)}"]`);
+    if (li) li.remove();
+    checkEmptyState();
     const r = await fetch('/delete/' + encodeURIComponent(filename), { method: 'DELETE' });
     if (r.ok) {
       toast(`Deleted: ${filename}`, 'ok');
     } else {
-      toast('Delete failed', 'err');
+      toast('Delete failed — refreshing', 'err');
     }
     refreshStatus();
+  }
+
+  // ── Show empty state if file list is now empty ────────────────────
+  function checkEmptyState() {
+    const ul = document.getElementById('fileList');
+    const empty = document.getElementById('emptyState');
+    empty.style.display = ul.children.length === 0 ? '' : 'none';
+  }
+
+  // ── Cancel indexing ────────────────────────────────────────────────
+  async function cancelIndexing() {
+    const btn = document.getElementById('cancelBtn');
+    btn.disabled = true;
+    btn.textContent = 'Cancelling…';
+    await fetch('/cancel', { method: 'POST' });
+    toast('Cancellation requested — will stop after current page', 'ok');
+  }
+
+  // ── Immediate queued feedback (before first poll returns active state) ──
+  function showQueued(filename) {
+    document.getElementById('dot').className = 'dot busy';
+    document.getElementById('dotLabel').textContent = 'Indexing…';
+    const pw = document.getElementById('progressWrap');
+    document.getElementById('idleWrap').style.display = 'none';
+    pw.classList.add('visible');
+    document.getElementById('progFile').textContent = filename;
+    document.getElementById('progPct').textContent = '0%';
+    document.getElementById('progBar').style.width = '0%';
+    document.getElementById('progPages').textContent = 'Starting…';
   }
 
   // ── Status poll ────────────────────────────────────────────────────
@@ -548,7 +624,9 @@ def ui():
         document.getElementById('progPct').textContent = pct + '%';
         document.getElementById('progBar').style.width = pct + '%';
         document.getElementById('progPages').textContent =
-          `Page ${job.current_page} of ${job.total_pages}`;
+          job.current_page === 0 ? 'Starting…' : `Page ${job.current_page} of ${job.total_pages}`;
+        const cb = document.getElementById('cancelBtn');
+        cb.disabled = false; cb.textContent = '✕ Cancel';
       } else {
         pw.classList.remove('visible');
         iw.style.display = '';
@@ -565,6 +643,7 @@ def ui():
         indexed.forEach(fn => {
           const esc = fn.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
           const li = document.createElement('li');
+          li.dataset.file = fn;
           li.innerHTML = `
             <div class="file-icon">📄</div>
             <div class="file-name" title="${fn}">${fn}</div>

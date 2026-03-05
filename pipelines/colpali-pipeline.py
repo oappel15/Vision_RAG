@@ -53,6 +53,7 @@ class Pipeline:
         self._initialized = False
         self._index_lock = threading.Lock()
         self._index_thread: threading.Thread = None
+        self._cancel_flag = threading.Event()
 
     async def on_startup(self):
         log.info("on_startup: loading model eagerly in executor …")
@@ -162,6 +163,7 @@ class Pipeline:
         log.info("Background indexing thread started")
 
     def _background_index_worker(self):
+        self._cancel_flag.clear()
         with self._index_lock:
             try:
                 self._index_local_pdfs()
@@ -248,20 +250,32 @@ class Pipeline:
         global_page_id = self.qdrant.get_collection(collection).points_count
 
         for pdf_file in to_index:
+            if self._cancel_flag.is_set():
+                log.info("Indexing cancelled — stopping before next file")
+                break
             # Resume from the last completed page, or start from 1
             start_page = file_progress.get(pdf_file.name, 0) + 1
             log.info(f"  Indexing {pdf_file.name} (from page {start_page}) …")
             global_page_id = self._ingest(pdf_file.name, collection, global_page_id, start_page)
-            indexed.add(pdf_file.name)
-            state["indexed_files"] = list(indexed)
+            if self._cancel_flag.is_set():
+                log.info(f"Indexing cancelled after {pdf_file.name}")
+                break
+            # Reload state before writing so sidecar deletions made during indexing are preserved
+            state = self._load_state()
+            if pdf_file.name not in state.get("indexed_files", []):
+                state.setdefault("indexed_files", []).append(pdf_file.name)
             state["schema_version"] = SCHEMA_VERSION
             state.get("file_progress", {}).pop(pdf_file.name, None)
             self._save_state(state)
 
-        # Clear index_job on completion
+        # Clear index_job on completion or cancellation
+        state = self._load_state()
         state["index_job"] = {}
         self._save_state(state)
-        log.info("✓ All PDFs indexed")
+        if self._cancel_flag.is_set():
+            log.info("Indexing cancelled — partial progress checkpointed, will resume on next run")
+        else:
+            log.info("✓ All PDFs indexed")
 
     def _ingest(self, filename: str, collection: str, start_id: int, start_page: int = 1) -> int:
         from pdf2image import pdfinfo_from_path
@@ -274,8 +288,20 @@ class Pipeline:
         if "file_progress" not in state:
             state["file_progress"] = {}
 
+        # Write index_job immediately so UI shows progress before first page completes
+        state["index_job"] = {
+            "active": True,
+            "current_file": filename,
+            "current_page": 0,
+            "total_pages": total_pages,
+        }
+        self._save_state(state)
+
         pid = start_id
         for page_num in range(start_page, total_pages + 1):
+            if self._cancel_flag.is_set():
+                log.info(f"    Cancelled at page {page_num}/{total_pages} — progress saved")
+                break
             # Convert one page at a time to avoid loading the full PDF into memory
             page_img = convert_from_path(
                 str(pdf_path), dpi=200, first_page=page_num, last_page=page_num
@@ -424,6 +450,11 @@ class Pipeline:
             # Internal trigger from pdf-ingest sidecar
             if query.strip() == "__index_now__":
                 self._start_background_index()
+                return "__ok__"
+
+            if query.strip() == "__cancel_index__":
+                self._cancel_flag.set()
+                log.info("Cancellation flag set — indexing will stop at next page boundary")
                 return "__ok__"
 
             # User status query
