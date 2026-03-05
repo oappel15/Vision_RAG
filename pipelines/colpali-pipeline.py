@@ -1,7 +1,7 @@
 """
 title: ColQwen2 Visual RAG (CPU) – Multi-Vector MaxSim
 author: adapted
-version: 9.0
+version: 10.0
 license: MIT
 description: Visual RAG pipeline using ColQwen2 multi-vector MaxSim + Qdrant + OpenRouter VLM.
              Background indexing thread — queries are never blocked by indexing.
@@ -42,6 +42,8 @@ class Pipeline:
         # OPENROUTER_MODEL: str = "google/gemini-2.0-flash-001"
         SHOW_SOURCE_PAGES: bool = True
         IMAGE_SERVER_URL: str = "http://localhost:8081"
+        PDF_SERVER_URL: str = "http://localhost:8082/pdfs"
+        PDF_VIEW_URL: str = "http://localhost:8082/view"
         IMAGE_CACHE_DIR: str = "/app/pipelines/cache/images"
 
     def __init__(self):
@@ -360,15 +362,61 @@ class Pipeline:
             with_payload=True,
         ).points
 
-    # ── VLM call via OpenRouter ──────────────────────────────────────
+    # ── VLM helpers ───────────────────────────────────────────────────
 
-    def _call_vlm(self, query: str, hits) -> tuple:
+    def _expand_refs(self, text: str, hits, cited: set) -> str:
+        """Replace [REF:N] and [REF:N, REF:M, ...] with bold page links."""
+        def _sub(m):
+            nums = re.findall(r'\d+', m.group(0))
+            parts = []
+            for n in nums:
+                idx = int(n) - 1
+                if 0 <= idx < len(hits):
+                    cited.add(idx)
+                    hit = hits[idx]
+                    pg = hit.payload.get("page_number", "?")
+                    source = hit.payload.get("source", "")
+                    url = f"{self.valves.PDF_VIEW_URL}/{source}/{pg}" if source else ""
+                    parts.append(f"**[\\[Page {pg}\\]]({url})**" if url else f"Page {pg}")
+            return " ".join(parts) if parts else m.group(0)
+
+        return re.sub(
+            r'\[REF\s*:\s*\d+(?:\s*[,;]\s*REF\s*:\s*\d+)*\s*\]',
+            _sub, text, flags=re.IGNORECASE,
+        )
+
+    def _build_source_table(self, cited_hits) -> str:
+        """Build a markdown thumbnail table from a list of hits. Returns empty string if no images."""
+        headers, divider, images = [], [], []
+        for hit in cited_hits:
+            img_filename = hit.payload.get("image_filename", "")
+            source = hit.payload.get("source", "unknown")
+            page = hit.payload.get("page_number", "?")
+            score = hit.score
+            if img_filename:
+                thumb_filename = self._make_thumbnail_file(img_filename)
+                full_url = f"{self.valves.IMAGE_SERVER_URL}/{img_filename}"
+                thumb_url = f"{self.valves.IMAGE_SERVER_URL}/{thumb_filename}"
+                headers.append(f"p{page} · {source} ({score:.2f})")
+                divider.append(":---:")
+                images.append(f"[![p{page}]({thumb_url})]({full_url})")
+        if not images:
+            return ""
+        return (
+            "| " + " | ".join(headers) + " |\n"
+            "| " + " | ".join(divider) + " |\n"
+            "| " + " | ".join(images)  + " |\n\n"
+        )
+
+    def _stream_vlm(self, query: str, hits, cited: set):
+        """Generator: stream OpenRouter SSE response, replacing [REF:N] inline."""
         import requests as _req
 
         api_key = self.valves.OPENROUTER_API_KEY
         model = self.valves.OPENROUTER_MODEL
         if not api_key:
-            return "Error: OPENROUTER_API_KEY not set.", set()
+            yield "Error: OPENROUTER_API_KEY not set."
+            return
 
         content_parts = [{"type": "text", "text": query}]
         for i, hit in enumerate(hits, 1):
@@ -385,7 +433,7 @@ class Pipeline:
                     "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"},
                 })
 
-        resp = _req.post(
+        with _req.post(
             "https://openrouter.ai/api/v1/chat/completions",
             headers={
                 "Authorization": f"Bearer {api_key}",
@@ -414,61 +462,65 @@ class Pipeline:
                     {"role": "user", "content": content_parts},
                 ],
                 "max_tokens": 2048,
+                "stream": True,
             },
+            stream=True,
             timeout=120,
-        )
-        resp.raise_for_status()
-        answer = resp.json()["choices"][0]["message"]["content"]
+        ) as resp:
+            resp.raise_for_status()
+            carry = ""
+            for line in resp.iter_lines():
+                if not line or not line.startswith(b"data: "):
+                    continue
+                data = line[6:]
+                if data == b"[DONE]":
+                    break
+                parsed = json.loads(data)
+                choices = parsed.get("choices", [])
+                if not choices:
+                    continue
+                delta = choices[0]["delta"].get("content", "")
+                if not delta:
+                    continue
 
-        # Parse which REF indices were cited (1-based → 0-based), tolerant of spacing/case
-        cited = {int(m) - 1 for m in re.findall(r'\[REF\s*:\s*(\d+)\]', answer, re.IGNORECASE)}
+                text = carry + delta
+                carry = ""
 
-        # Replace [REF:N] variants with a linked [Page X] pointing to the full image
-        for i, hit in enumerate(hits, 1):
-            pg = hit.payload.get("page_number", "?")
-            img_filename = hit.payload.get("image_filename", "")
-            full_url = f"{self.valves.IMAGE_SERVER_URL}/{img_filename}" if img_filename else ""
-            replacement = f"**[\\[Page {pg}\\]]({full_url})**" if full_url else f"Page {pg}"
-            answer = re.sub(rf'\[REF\s*:\s*{i}\]', replacement, answer, flags=re.IGNORECASE)
+                # Hold back from the first unclosed [ (multi-ref safe)
+                open_pos = text.find('[')
+                while open_pos != -1:
+                    close_pos = text.find(']', open_pos)
+                    if close_pos == -1:
+                        carry = text[open_pos:]
+                        text = text[:open_pos]
+                        break
+                    open_pos = text.find('[', close_pos + 1)
 
-        return answer, cited
+                text = self._expand_refs(text, hits, cited)
+                if text:
+                    yield text
 
-    # ── main entry ───────────────────────────────────────────────────
+            # Flush carry buffer
+            if carry:
+                carry = self._expand_refs(carry, hits, cited)
+                if carry:
+                    yield carry
 
-    def pipe(self, body: dict, **kwargs) -> str:
+    # ── streaming entry point ─────────────────────────────────────────
+
+    def _pipe_stream(self, query: str):
+        """Generator yielding streaming response chunks for a normal query."""
         try:
-            if not self._initialized:
-                return "Pipeline initializing — model loading in progress. Please retry in ~60 seconds."
-
-            messages = body.get("messages", [])
-            query = messages[-1]["content"] if messages else ""
-            if not query:
-                return "Please ask a question about your documents."
-
-            log.info(f"Query: {query}")
-
-            # Internal trigger from pdf-ingest sidecar
-            if query.strip() == "__index_now__":
-                self._start_background_index()
-                return "__ok__"
-
-            if query.strip() == "__cancel_index__":
-                self._cancel_flag.set()
-                log.info("Cancellation flag set — indexing will stop at next page boundary")
-                return "__ok__"
-
-            # User status query
-            if query.strip().lower() in ("status", "indexing status", "/status"):
-                return self._format_index_status()
+            # Step 1 — show retrieval status immediately
+            yield "> 🔍 Searching indexed documents…\n\n"
 
             hits = self._search(query, top_k=self.valves.TOP_K)
-
-            # Filter low-confidence results
             if self.valves.SCORE_THRESHOLD > 0:
                 hits = [h for h in hits if h.score >= self.valves.SCORE_THRESHOLD]
 
             if not hits:
-                return "No relevant pages found in the indexed documents."
+                yield "No relevant pages found in the indexed documents."
+                return
 
             log.info(f"Retrieved {len(hits)} pages")
             for h in hits:
@@ -477,42 +529,60 @@ class Pipeline:
                     f"score={h.score:.4f}"
                 )
 
-            answer, cited_indices = self._call_vlm(query, hits)
+            # Step 2 — pages found summary
+            lines = [f"> 📄 **Found {len(hits)} pages — sending to Vision model:**"]
+            for h in hits:
+                src = h.payload.get("source", "?")
+                pg = h.payload.get("page_number", "?")
+                lines.append(f">   - `{src}` p{pg} (score: {h.score:.2f})")
+            yield "\n".join(lines) + "\n\n---\n\n"
 
-            # ── Source thumbnails via image-server ────────────────────
+            # Step 3 — stream VLM answer
+            cited: set = set()
+            yield from self._stream_vlm(query, hits, cited)
+
+            # Step 4 — source thumbnails
             if self.valves.SHOW_SOURCE_PAGES:
-                cited_hits = [hits[i] for i in sorted(cited_indices) if i < len(hits)]
+                cited_hits = [hits[i] for i in sorted(cited) if i < len(hits)]
                 if not cited_hits:
                     cited_hits = hits  # fallback if model didn't use REF format
-                answer += "\n\n---\n\n**📄 Source Pages:**\n\n"
-                headers = []
-                divider = []
-                images = []
-                for hit in cited_hits:
-                    img_filename = hit.payload.get("image_filename", "")
-                    source = hit.payload.get("source", "unknown")
-                    page = hit.payload.get("page_number", "?")
-                    score = hit.score
-
-                    if img_filename:
-                        thumb_filename = self._make_thumbnail_file(img_filename)
-                        full_url = f"{self.valves.IMAGE_SERVER_URL}/{img_filename}"
-                        thumb_url = f"{self.valves.IMAGE_SERVER_URL}/{thumb_filename}"
-                        headers.append(f"p{page} · {source} ({score:.2f})")
-                        divider.append(":---:")
-                        images.append(f"[![p{page}]({thumb_url})]({full_url})")
-                if images:
-                    answer += (
-                        "| " + " | ".join(headers) + " |\n"
-                        "| " + " | ".join(divider) + " |\n"
-                        "| " + " | ".join(images)  + " |\n\n"
-                    )
-
-            return answer
+                table = self._build_source_table(cited_hits)
+                if table:
+                    yield "\n\n---\n\n**📄 Source Pages:**\n\n" + table
 
         except Exception as e:
-            log.error(f"pipe error: {e}", exc_info=True)
-            return f"Error: {e}"
+            log.error(f"pipe stream error: {e}", exc_info=True)
+            yield f"\n\nError: {e}"
+
+    # ── main entry ───────────────────────────────────────────────────
+
+    def pipe(self, body: dict, **kwargs):
+        if not self._initialized:
+            return "Pipeline initializing — model loading in progress. Please retry in ~60 seconds."
+
+        messages = body.get("messages", [])
+        query = messages[-1]["content"] if messages else ""
+        if not query:
+            return "Please ask a question about your documents."
+
+        log.info(f"Query: {query}")
+
+        # Internal trigger from pdf-ingest sidecar
+        if query.strip() == "__index_now__":
+            self._start_background_index()
+            return "__ok__"
+
+        if query.strip() == "__cancel_index__":
+            self._cancel_flag.set()
+            log.info("Cancellation flag set — indexing will stop at next page boundary")
+            return "__ok__"
+
+        # User status query
+        if query.strip().lower() in ("status", "indexing status", "/status"):
+            return self._format_index_status()
+
+        # Normal query → streaming generator
+        return self._pipe_stream(query)
 
 
 
