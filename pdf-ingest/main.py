@@ -11,6 +11,7 @@ import pathlib
 import requests
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 
 app = FastAPI()
 
@@ -21,6 +22,76 @@ PIPELINES_API_KEY = os.getenv("PIPELINES_API_KEY", "0p3n-w3bu!")
 PIPELINE_MODEL = os.getenv("PIPELINE_MODEL", "colpali-pipeline")
 
 PDF_DIR.mkdir(parents=True, exist_ok=True)
+
+app.mount("/pdfs", StaticFiles(directory=str(PDF_DIR)), name="pdfs")
+
+
+@app.get("/view/{filename}/{page}", response_class=HTMLResponse)
+def view_pdf_at_page(filename: str, page: int):
+    """Render a specific PDF page using PDF.js — no browser fragment support required."""
+    return f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8"/>
+<title>{filename} — Page {page}</title>
+<style>
+  *{{margin:0;padding:0;box-sizing:border-box}}
+  body{{background:#525659;display:flex;flex-direction:column;height:100vh;font-family:sans-serif}}
+  #bar{{background:#3d4043;color:#e8eaed;padding:8px 16px;display:flex;align-items:center;gap:10px;font-size:14px;flex-shrink:0}}
+  #bar button{{background:#5f6368;color:#e8eaed;border:none;padding:5px 14px;border-radius:4px;cursor:pointer;font-size:13px}}
+  #bar button:hover{{background:#8ab4f8;color:#000}}
+  #bar button:disabled{{opacity:.4;cursor:default}}
+  #bar .info{{color:#9aa0a6;margin-left:8px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
+  #main{{flex:1;overflow:auto;display:flex;flex-direction:column;align-items:center;padding:20px;gap:12px}}
+  canvas{{background:#fff;box-shadow:0 2px 12px rgba(0,0,0,.5)}}
+  #loading{{color:#e8eaed;font-size:15px;margin-top:40px}}
+</style>
+</head>
+<body>
+<div id="bar">
+  <button id="btnPrev" onclick="go(-1)" disabled>&#9664; Prev</button>
+  <button id="btnNext" onclick="go(1)" disabled>Next &#9654;</button>
+  <span id="pageLabel">Page {page}</span>
+  <span class="info">{filename}</span>
+</div>
+<div id="main"><div id="loading">Loading…</div></div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script>
+  pdfjsLib.GlobalWorkerOptions.workerSrc =
+    'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+
+  let pdf = null, cur = {page};
+  const main = document.getElementById('main');
+
+  pdfjsLib.getDocument('/pdfs/{filename}').promise.then(doc => {{
+    pdf = doc;
+    render(cur);
+  }}).catch(e => {{
+    document.getElementById('loading').textContent = 'Failed to load PDF: ' + e.message;
+  }});
+
+  function render(n) {{
+    main.innerHTML = '<div id="loading">Rendering…</div>';
+    pdf.getPage(n).then(page => {{
+      const vp = page.getViewport({{scale: 1.5}});
+      const canvas = document.createElement('canvas');
+      canvas.width = vp.width; canvas.height = vp.height;
+      main.innerHTML = '';
+      main.appendChild(canvas);
+      page.render({{canvasContext: canvas.getContext('2d'), viewport: vp}});
+      document.getElementById('pageLabel').textContent = `Page ${{n}} of ${{pdf.numPages}}`;
+      document.getElementById('btnPrev').disabled = n <= 1;
+      document.getElementById('btnNext').disabled = n >= pdf.numPages;
+    }});
+  }}
+
+  function go(d) {{
+    const n = cur + d;
+    if (pdf && n >= 1 && n <= pdf.numPages) {{ cur = n; render(cur); }}
+  }}
+</script>
+</body>
+</html>"""
 
 
 @app.post("/upload")
