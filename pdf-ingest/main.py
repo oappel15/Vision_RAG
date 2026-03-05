@@ -1,0 +1,598 @@
+"""
+pdf-ingest sidecar service
+Saves PDFs to shared volume and triggers background indexing in the pipelines container.
+No ML dependencies — purely file I/O + HTTP.
+"""
+
+import json
+import os
+import pathlib
+
+import requests
+from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.responses import HTMLResponse, JSONResponse
+
+app = FastAPI()
+
+PDF_DIR = pathlib.Path(os.getenv("PDF_DIR", "/app/downloads"))
+STATE_FILE = pathlib.Path(os.getenv("STATE_FILE", "/app/pipelines/pipeline_state.json"))
+PIPELINES_URL = os.getenv("PIPELINES_URL", "http://pipelines:9099")
+PIPELINES_API_KEY = os.getenv("PIPELINES_API_KEY", "0p3n-w3bu!")
+PIPELINE_MODEL = os.getenv("PIPELINE_MODEL", "colpali-pipeline")
+
+PDF_DIR.mkdir(parents=True, exist_ok=True)
+
+
+@app.post("/upload")
+async def upload_pdf(file: UploadFile = File(...)):
+    if not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only PDF files are accepted.")
+
+    dest = PDF_DIR / file.filename
+    content = await file.read()
+    with open(dest, "wb") as f:
+        f.write(content)
+
+    # Fire-and-forget: trigger background indexing via existing pipeline API
+    try:
+        requests.post(
+            f"{PIPELINES_URL}/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {PIPELINES_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": PIPELINE_MODEL,
+                "messages": [{"role": "user", "content": "__index_now__"}],
+            },
+            timeout=5,
+        )
+    except Exception:
+        pass  # pipeline may still be starting up; indexing will run on next startup too
+
+    return {"status": "uploaded", "filename": file.filename, "size_bytes": len(content)}
+
+
+@app.get("/status")
+def get_status():
+    if STATE_FILE.exists():
+        with open(STATE_FILE) as f:
+            return JSONResponse(json.load(f))
+    return JSONResponse({})
+
+
+@app.delete("/delete/{filename}")
+def delete_pdf(filename: str):
+    pdf_path = PDF_DIR / filename
+    if not pdf_path.exists():
+        raise HTTPException(status_code=404, detail="File not found.")
+    pdf_path.unlink()
+
+    if STATE_FILE.exists():
+        with open(STATE_FILE) as f:
+            state = json.load(f)
+        indexed = state.get("indexed_files", [])
+        if filename in indexed:
+            indexed.remove(filename)
+            state["indexed_files"] = indexed
+            tmp = str(STATE_FILE) + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(state, f)
+            os.replace(tmp, str(STATE_FILE))
+
+    return {"status": "deleted", "filename": filename}
+
+
+@app.get("/", response_class=HTMLResponse)
+@app.get("/ui", response_class=HTMLResponse)
+def ui():
+    return r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Vision RAG — PDF Indexer</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:        #0d1117;
+      --surface:   #161b22;
+      --surface2:  #21262d;
+      --border:    #30363d;
+      --accent:    #7c3aed;
+      --accent-hi: #a78bfa;
+      --accent-bg: rgba(124,58,237,.12);
+      --green:     #3fb950;
+      --green-bg:  rgba(63,185,80,.12);
+      --red:       #f85149;
+      --red-bg:    rgba(248,81,73,.12);
+      --amber:     #d29922;
+      --amber-bg:  rgba(210,153,34,.12);
+      --text:      #e6edf3;
+      --text-muted:#8b949e;
+      --radius:    12px;
+      --radius-sm: 8px;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      padding: 0;
+    }
+
+    /* ── Layout ── */
+    .shell {
+      display: grid;
+      grid-template-rows: auto 1fr;
+      min-height: 100vh;
+    }
+
+    header {
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 0 32px;
+      height: 60px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      position: sticky;
+      top: 0;
+      z-index: 10;
+    }
+
+    .logo {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-size: 15px;
+      font-weight: 600;
+      letter-spacing: -.2px;
+    }
+
+    .logo-icon {
+      width: 28px; height: 28px;
+      background: linear-gradient(135deg, var(--accent), #4f46e5);
+      border-radius: 7px;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 15px;
+    }
+
+    #statusDot {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 13px;
+      color: var(--text-muted);
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 20px;
+      padding: 5px 12px;
+    }
+
+    .dot {
+      width: 7px; height: 7px;
+      border-radius: 50%;
+      background: var(--green);
+      flex-shrink: 0;
+    }
+    .dot.busy { background: var(--amber); animation: pulse 1.4s ease-in-out infinite; }
+    .dot.err  { background: var(--red); }
+
+    @keyframes pulse {
+      0%,100% { opacity: 1; }
+      50%      { opacity: .35; }
+    }
+
+    main {
+      max-width: 860px;
+      margin: 0 auto;
+      padding: 36px 24px 60px;
+      width: 100%;
+    }
+
+    /* ── Cards ── */
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 24px;
+      margin-bottom: 20px;
+    }
+
+    .card-title {
+      font-size: 13px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: .06em;
+      color: var(--text-muted);
+      margin-bottom: 18px;
+    }
+
+    /* ── Drop zone ── */
+    #dropzone {
+      border: 2px dashed var(--border);
+      border-radius: var(--radius-sm);
+      padding: 44px 24px;
+      text-align: center;
+      cursor: pointer;
+      transition: border-color .2s, background .2s;
+      position: relative;
+    }
+    #dropzone:hover, #dropzone.over {
+      border-color: var(--accent);
+      background: var(--accent-bg);
+    }
+    #dropzone input[type=file] {
+      position: absolute; inset: 0; opacity: 0; cursor: pointer;
+    }
+    .drop-icon { font-size: 36px; margin-bottom: 12px; }
+    .drop-label {
+      font-size: 15px; font-weight: 500; color: var(--text);
+      margin-bottom: 4px;
+    }
+    .drop-sub { font-size: 13px; color: var(--text-muted); }
+    #selectedFile {
+      margin-top: 12px; font-size: 13px; color: var(--accent-hi);
+      font-weight: 500; min-height: 18px;
+    }
+
+    /* ── Upload button ── */
+    #uploadBtn {
+      margin-top: 16px;
+      width: 100%;
+      background: linear-gradient(135deg, var(--accent), #4f46e5);
+      color: #fff;
+      border: none;
+      border-radius: var(--radius-sm);
+      padding: 13px 20px;
+      font-size: 15px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: opacity .15s, transform .1s;
+      display: flex; align-items: center; justify-content: center; gap: 8px;
+    }
+    #uploadBtn:hover  { opacity: .88; }
+    #uploadBtn:active { transform: scale(.98); }
+    #uploadBtn:disabled { opacity: .4; cursor: default; }
+
+    /* ── Toast ── */
+    #toast {
+      position: fixed;
+      bottom: 28px; left: 50%;
+      transform: translateX(-50%) translateY(80px);
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 12px 20px;
+      font-size: 14px;
+      font-weight: 500;
+      opacity: 0;
+      transition: transform .3s cubic-bezier(.34,1.56,.64,1), opacity .3s;
+      z-index: 100;
+      white-space: nowrap;
+      max-width: 90vw;
+    }
+    #toast.show {
+      transform: translateX(-50%) translateY(0);
+      opacity: 1;
+    }
+    #toast.ok  { border-color: var(--green);  color: var(--green);  }
+    #toast.err { border-color: var(--red);    color: var(--red);    }
+
+    /* ── Progress ── */
+    #progressWrap { display: none; }
+    #progressWrap.visible { display: block; }
+
+    .progress-header {
+      display: flex; align-items: center; justify-content: space-between;
+      margin-bottom: 10px;
+    }
+    .progress-file {
+      font-size: 14px; font-weight: 500;
+      color: var(--accent-hi);
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+      max-width: 70%;
+    }
+    .progress-pct {
+      font-size: 13px; font-weight: 600; color: var(--text-muted);
+    }
+    .progress-track {
+      height: 6px;
+      background: var(--surface2);
+      border-radius: 99px;
+      overflow: hidden;
+      margin-bottom: 8px;
+    }
+    .progress-bar {
+      height: 100%;
+      background: linear-gradient(90deg, var(--accent), var(--accent-hi));
+      border-radius: 99px;
+      transition: width .5s ease;
+      width: 0%;
+    }
+    .progress-pages {
+      font-size: 12px; color: var(--text-muted);
+    }
+
+    .idle-badge {
+      display: inline-flex; align-items: center; gap: 6px;
+      background: var(--green-bg);
+      color: var(--green);
+      font-size: 13px; font-weight: 500;
+      padding: 5px 12px;
+      border-radius: 20px;
+      border: 1px solid rgba(63,185,80,.25);
+    }
+
+    /* ── File library ── */
+    #fileList { list-style: none; }
+    #fileList li {
+      display: flex; align-items: center; gap: 12px;
+      padding: 11px 0;
+      border-bottom: 1px solid var(--border);
+    }
+    #fileList li:last-child { border-bottom: none; }
+
+    .file-icon {
+      width: 34px; height: 34px; flex-shrink: 0;
+      background: var(--accent-bg);
+      border-radius: 8px;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 16px;
+    }
+    .file-name {
+      flex: 1; font-size: 14px; font-weight: 500;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+    .file-badge {
+      font-size: 11px; font-weight: 600; text-transform: uppercase;
+      letter-spacing: .05em;
+      background: var(--green-bg); color: var(--green);
+      border: 1px solid rgba(63,185,80,.2);
+      border-radius: 20px; padding: 2px 9px;
+      flex-shrink: 0;
+    }
+
+    .btn-del {
+      flex-shrink: 0;
+      background: transparent;
+      border: 1px solid var(--border);
+      color: var(--text-muted);
+      border-radius: var(--radius-sm);
+      padding: 5px 10px;
+      font-size: 12px;
+      cursor: pointer;
+      transition: background .15s, color .15s, border-color .15s;
+    }
+    .btn-del:hover {
+      background: var(--red-bg);
+      color: var(--red);
+      border-color: rgba(248,81,73,.3);
+    }
+
+    .empty-state {
+      text-align: center; padding: 32px 0;
+      color: var(--text-muted); font-size: 14px;
+    }
+    .empty-state .empty-icon { font-size: 32px; margin-bottom: 8px; }
+  </style>
+</head>
+<body>
+<div class="shell">
+
+  <header>
+    <div class="logo">
+      <div class="logo-icon">📄</div>
+      Vision RAG — PDF Indexer
+    </div>
+    <div id="statusDot">
+      <span class="dot" id="dot"></span>
+      <span id="dotLabel">Checking…</span>
+    </div>
+  </header>
+
+  <main>
+
+    <!-- Upload card -->
+    <div class="card">
+      <div class="card-title">Upload Document</div>
+
+      <div id="dropzone">
+        <input type="file" id="fileInput" accept=".pdf" />
+        <div class="drop-icon">📂</div>
+        <div class="drop-label">Drop a PDF here or click to browse</div>
+        <div class="drop-sub">Only PDF files · any size</div>
+        <div id="selectedFile"></div>
+      </div>
+
+      <button id="uploadBtn" disabled onclick="uploadFile()">
+        <span id="uploadBtnIcon">⬆</span>
+        <span id="uploadBtnLabel">Select a file first</span>
+      </button>
+    </div>
+
+    <!-- Indexing status card -->
+    <div class="card">
+      <div class="card-title">Indexing Status</div>
+      <div id="progressWrap">
+        <div class="progress-header">
+          <div class="progress-file" id="progFile">—</div>
+          <div class="progress-pct" id="progPct">0%</div>
+        </div>
+        <div class="progress-track">
+          <div class="progress-bar" id="progBar"></div>
+        </div>
+        <div class="progress-pages" id="progPages"></div>
+      </div>
+      <div id="idleWrap"><div class="idle-badge">● Idle — all documents indexed</div></div>
+    </div>
+
+    <!-- File library card -->
+    <div class="card">
+      <div class="card-title">Document Library</div>
+      <ul id="fileList"></ul>
+      <div class="empty-state" id="emptyState" style="display:none">
+        <div class="empty-icon">🗂</div>
+        No documents indexed yet.<br>Upload a PDF above to get started.
+      </div>
+    </div>
+
+  </main>
+</div>
+
+<!-- Toast -->
+<div id="toast"></div>
+
+<script>
+  // ── Drag-and-drop ──────────────────────────────────────────────────
+  const dz = document.getElementById('dropzone');
+  const fi = document.getElementById('fileInput');
+
+  dz.addEventListener('dragover',  e => { e.preventDefault(); dz.classList.add('over'); });
+  dz.addEventListener('dragleave', () => dz.classList.remove('over'));
+  dz.addEventListener('drop', e => {
+    e.preventDefault(); dz.classList.remove('over');
+    if (e.dataTransfer.files.length) {
+      fi.files = e.dataTransfer.files;
+      onFileSelected();
+    }
+  });
+  fi.addEventListener('change', onFileSelected);
+
+  function onFileSelected() {
+    const f = fi.files[0];
+    if (!f) return;
+    document.getElementById('selectedFile').textContent = `${f.name}  (${(f.size/1024).toFixed(1)} KB)`;
+    const btn = document.getElementById('uploadBtn');
+    btn.disabled = false;
+    document.getElementById('uploadBtnLabel').textContent = `Upload & Index  "${f.name}"`;
+  }
+
+  // ── Upload ─────────────────────────────────────────────────────────
+  async function uploadFile() {
+    const f = fi.files[0];
+    if (!f) return;
+    const btn = document.getElementById('uploadBtn');
+    btn.disabled = true;
+    document.getElementById('uploadBtnLabel').textContent = 'Uploading…';
+    document.getElementById('uploadBtnIcon').textContent = '⏳';
+
+    const form = new FormData();
+    form.append('file', f);
+    try {
+      const r = await fetch('/upload', { method: 'POST', body: form });
+      const d = await r.json();
+      if (r.ok) {
+        toast(`✓ ${d.filename} uploaded — indexing started`, 'ok');
+        fi.value = '';
+        document.getElementById('selectedFile').textContent = '';
+        document.getElementById('uploadBtnLabel').textContent = 'Select a file first';
+        document.getElementById('uploadBtnIcon').textContent = '⬆';
+      } else {
+        toast(`Error: ${d.detail}`, 'err');
+        btn.disabled = false;
+        document.getElementById('uploadBtnLabel').textContent = 'Retry Upload';
+        document.getElementById('uploadBtnIcon').textContent = '⬆';
+      }
+    } catch (e) {
+      toast(`Upload failed: ${e}`, 'err');
+      btn.disabled = false;
+      document.getElementById('uploadBtnLabel').textContent = 'Retry Upload';
+      document.getElementById('uploadBtnIcon').textContent = '⬆';
+    }
+    refreshStatus();
+  }
+
+  // ── Delete ─────────────────────────────────────────────────────────
+  async function deletePdf(filename) {
+    if (!confirm(`Remove "${filename}" from the index and delete from disk?`)) return;
+    const r = await fetch('/delete/' + encodeURIComponent(filename), { method: 'DELETE' });
+    if (r.ok) {
+      toast(`Deleted: ${filename}`, 'ok');
+    } else {
+      toast('Delete failed', 'err');
+    }
+    refreshStatus();
+  }
+
+  // ── Status poll ────────────────────────────────────────────────────
+  async function refreshStatus() {
+    try {
+      const r = await fetch('/status');
+      const data = await r.json();
+      const job = data.index_job || {};
+      const indexed = data.indexed_files || [];
+
+      // Header dot
+      const dot = document.getElementById('dot');
+      const dotLabel = document.getElementById('dotLabel');
+      if (job.active) {
+        dot.className = 'dot busy';
+        dotLabel.textContent = 'Indexing…';
+      } else {
+        dot.className = 'dot';
+        dotLabel.textContent = `${indexed.length} doc${indexed.length !== 1 ? 's' : ''} indexed`;
+      }
+
+      // Progress section
+      const pw = document.getElementById('progressWrap');
+      const iw = document.getElementById('idleWrap');
+      if (job.active) {
+        pw.classList.add('visible');
+        iw.style.display = 'none';
+        const pct = job.total_pages > 0 ? Math.round(job.current_page / job.total_pages * 100) : 0;
+        document.getElementById('progFile').textContent = job.current_file;
+        document.getElementById('progPct').textContent = pct + '%';
+        document.getElementById('progBar').style.width = pct + '%';
+        document.getElementById('progPages').textContent =
+          `Page ${job.current_page} of ${job.total_pages}`;
+      } else {
+        pw.classList.remove('visible');
+        iw.style.display = '';
+      }
+
+      // File list
+      const ul = document.getElementById('fileList');
+      const empty = document.getElementById('emptyState');
+      ul.innerHTML = '';
+      if (indexed.length === 0) {
+        empty.style.display = '';
+      } else {
+        empty.style.display = 'none';
+        indexed.forEach(fn => {
+          const esc = fn.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+          const li = document.createElement('li');
+          li.innerHTML = `
+            <div class="file-icon">📄</div>
+            <div class="file-name" title="${fn}">${fn}</div>
+            <span class="file-badge">indexed</span>
+            <button class="btn-del" onclick="deletePdf('${esc}')">Remove</button>
+          `;
+          ul.appendChild(li);
+        });
+      }
+    } catch (e) {
+      document.getElementById('dotLabel').textContent = 'Offline';
+      document.getElementById('dot').className = 'dot err';
+    }
+  }
+
+  // ── Toast helper ───────────────────────────────────────────────────
+  let toastTimer;
+  function toast(msg, type = 'ok') {
+    const el = document.getElementById('toast');
+    el.textContent = msg;
+    el.className = `show ${type}`;
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => { el.className = ''; }, 3500);
+  }
+
+  refreshStatus();
+  setInterval(refreshStatus, 3000);
+</script>
+</body>
+</html>
+"""

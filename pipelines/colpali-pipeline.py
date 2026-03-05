@@ -1,12 +1,14 @@
 """
 title: ColQwen2 Visual RAG (CPU) – Multi-Vector MaxSim
 author: adapted
-version: 8.0
+version: 9.0
 license: MIT
 description: Visual RAG pipeline using ColQwen2 multi-vector MaxSim + Qdrant + OpenRouter VLM.
+             Background indexing thread — queries are never blocked by indexing.
 """
 
-import os, json, base64, io, logging, pathlib, hashlib, re
+import asyncio
+import os, json, base64, io, logging, pathlib, hashlib, re, threading
 from typing import List, Optional
 
 import torch
@@ -49,9 +51,14 @@ class Pipeline:
         self.processor = None
         self.qdrant = None
         self._initialized = False
+        self._index_lock = threading.Lock()
+        self._index_thread: threading.Thread = None
 
     async def on_startup(self):
-        log.info("on_startup called – deferring heavy init to first query")
+        log.info("on_startup: loading model eagerly in executor …")
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, self._load_model)
+        self._start_background_index()
 
     async def on_shutdown(self):
         log.info("Pipeline shutdown")
@@ -65,8 +72,11 @@ class Pipeline:
         return {}
 
     def _save_state(self, state: dict):
-        with open(STATE_FILE, "w") as f:
+        """Atomic write — prevents JSON corruption if process dies mid-write."""
+        tmp = STATE_FILE + ".tmp"
+        with open(tmp, "w") as f:
             json.dump(state, f)
+        os.replace(tmp, STATE_FILE)
 
     def _save_page_image(self, page_img: Image.Image, filename: str, page_num: int) -> str:
         """Save page image to cache dir, return filename."""
@@ -95,13 +105,14 @@ class Pipeline:
             img.save(thumb_path, format="JPEG", quality=70)
         return thumb_filename
 
-    # ── full init ────────────────────────────────────────────────────
+    # ── model loading ─────────────────────────────────────────────────
 
-    def _full_init(self):
+    def _load_model(self):
+        """Load ColQwen2 + connect Qdrant. Called once at startup via executor."""
         if self._initialized:
             return
 
-        log.info("=== Full initialization starting ===")
+        log.info("=== Model loading starting ===")
 
         self.valves.OPENROUTER_API_KEY = os.getenv(
             "OPENROUTER_API_KEY", self.valves.OPENROUTER_API_KEY
@@ -128,13 +139,56 @@ class Pipeline:
             )
             log.info(f"✓ Qdrant connected at {self.valves.QDRANT_HOST}:{self.valves.QDRANT_PORT}")
 
-            self._index_local_pdfs()
             self._initialized = True
-            log.info("=== Full initialization complete ===")
+            log.info("=== Model loading complete ===")
 
         except Exception as e:
-            log.error(f"!!! Initialization failed: {e}", exc_info=True)
+            log.error(f"!!! Model loading failed: {e}", exc_info=True)
             raise
+
+    # ── background indexing ───────────────────────────────────────────
+
+    def _start_background_index(self):
+        """Spawn a daemon thread to run indexing, unless one is already running."""
+        if self._index_thread and self._index_thread.is_alive():
+            log.info("Indexing already in progress — skipping duplicate trigger")
+            return
+        self._index_thread = threading.Thread(
+            target=self._background_index_worker,
+            daemon=True,
+            name="pdf-indexer",
+        )
+        self._index_thread.start()
+        log.info("Background indexing thread started")
+
+    def _background_index_worker(self):
+        with self._index_lock:
+            try:
+                self._index_local_pdfs()
+            except Exception as e:
+                log.error(f"Background indexing failed: {e}", exc_info=True)
+
+    def _format_index_status(self) -> str:
+        """Return a human-readable markdown string describing current index state."""
+        state = self._load_state()
+        indexed = state.get("indexed_files", [])
+        job = state.get("index_job", {})
+
+        lines = ["**Indexing Status**\n"]
+        if job.get("active"):
+            lines.append(f"🔄 **In progress:** `{job['current_file']}`")
+            lines.append(f"   Page {job['current_page']} / {job['total_pages']}")
+        else:
+            lines.append("✅ **Idle** (no active indexing job)")
+
+        if indexed:
+            lines.append(f"\n**Indexed files ({len(indexed)}):**")
+            for fn in indexed:
+                lines.append(f"  - {fn}")
+        else:
+            lines.append("\nNo files indexed yet.")
+
+        return "\n".join(lines)
 
     # ── indexing ─────────────────────────────────────────────────────
 
@@ -204,6 +258,9 @@ class Pipeline:
             state.get("file_progress", {}).pop(pdf_file.name, None)
             self._save_state(state)
 
+        # Clear index_job on completion
+        state["index_job"] = {}
+        self._save_state(state)
         log.info("✓ All PDFs indexed")
 
     def _ingest(self, filename: str, collection: str, start_id: int, start_page: int = 1) -> int:
@@ -246,8 +303,14 @@ class Pipeline:
             log.info(f"    page {page_num}/{total_pages}  id={pid}  patches={len(multi_vec)}")
             pid += 1
 
-            # Checkpoint after every page so we can resume on crash
+            # Checkpoint after every page: persist progress + live index_job status
             state["file_progress"][filename] = page_num
+            state["index_job"] = {
+                "active": True,
+                "current_file": filename,
+                "current_page": page_num,
+                "total_pages": total_pages,
+            }
             self._save_state(state)
 
         return pid
@@ -348,7 +411,8 @@ class Pipeline:
 
     def pipe(self, body: dict, **kwargs) -> str:
         try:
-            self._full_init()
+            if not self._initialized:
+                return "Pipeline initializing — model loading in progress. Please retry in ~60 seconds."
 
             messages = body.get("messages", [])
             query = messages[-1]["content"] if messages else ""
@@ -356,6 +420,15 @@ class Pipeline:
                 return "Please ask a question about your documents."
 
             log.info(f"Query: {query}")
+
+            # Internal trigger from pdf-ingest sidecar
+            if query.strip() == "__index_now__":
+                self._start_background_index()
+                return "__ok__"
+
+            # User status query
+            if query.strip().lower() in ("status", "indexing status", "/status"):
+                return self._format_index_status()
 
             hits = self._search(query, top_k=self.valves.TOP_K)
 
