@@ -19,6 +19,7 @@ from qdrant_client import QdrantClient
 from qdrant_client.models import (
     Distance, VectorParams, PointStruct, SearchParams,
     MultiVectorConfig, MultiVectorComparator,
+    Filter, FieldCondition, MatchValue,
 )
 from colpali_engine.models import ColQwen2, ColQwen2Processor
 
@@ -45,6 +46,7 @@ class Pipeline:
         PDF_SERVER_URL: str = "http://localhost:8082/pdfs"
         PDF_VIEW_URL: str = "http://localhost:8082/view"
         IMAGE_CACHE_DIR: str = "/app/pipelines/cache/images"
+        ADJACENT_PAGES: int = 1   # pages to fetch on each side of cited pages (0 = disabled)
 
     def __init__(self):
         self.name = "ColQwen2 Visual RAG"
@@ -138,7 +140,7 @@ class Pipeline:
             log.info("✓ ColQwen2 ready")
 
             self.qdrant = QdrantClient(
-                host=self.valves.QDRANT_HOST, port=self.valves.QDRANT_PORT
+                host=self.valves.QDRANT_HOST, port=self.valves.QDRANT_PORT, timeout=60
             )
             log.info(f"✓ Qdrant connected at {self.valves.QDRANT_HOST}:{self.valves.QDRANT_PORT}")
 
@@ -354,13 +356,39 @@ class Pipeline:
         q_vecs = emb[0].tolist()   # shape: (num_query_tokens, dim)
         log.info(f"Query encoded → {len(q_vecs)} tokens")
 
-        return self.qdrant.query_points(
+        def _do_search():
+            return self.qdrant.query_points(
+                collection_name=self.valves.COLLECTION_NAME,
+                query=q_vecs,
+                limit=top_k,
+                search_params=SearchParams(exact=True),
+                with_payload=True,
+            ).points
+
+        try:
+            return _do_search()
+        except Exception as e:
+            log.warning(f"Qdrant search failed ({e}), reconnecting and retrying")
+            self.qdrant = QdrantClient(
+                host=self.valves.QDRANT_HOST, port=self.valves.QDRANT_PORT, timeout=60
+            )
+            return _do_search()
+
+    # ── adjacent page fetch ───────────────────────────────────────────
+
+    def _fetch_page(self, source: str, page_num: int):
+        """Return the Qdrant point for a specific source+page, or None if not found."""
+        points, _ = self.qdrant.scroll(
             collection_name=self.valves.COLLECTION_NAME,
-            query=q_vecs,             # ← MULTI-VECTOR query
-            limit=top_k,
-            search_params=SearchParams(exact=True),
+            scroll_filter=Filter(must=[
+                FieldCondition(key="source", match=MatchValue(value=source)),
+                FieldCondition(key="page_number", match=MatchValue(value=page_num)),
+            ]),
+            limit=1,
             with_payload=True,
-        ).points
+            with_vectors=False,
+        )
+        return points[0] if points else None
 
     # ── VLM helpers ───────────────────────────────────────────────────
 
@@ -392,12 +420,13 @@ class Pipeline:
             img_filename = hit.payload.get("image_filename", "")
             source = hit.payload.get("source", "unknown")
             page = hit.payload.get("page_number", "?")
-            score = hit.score
+            score = getattr(hit, "score", None)
             if img_filename:
                 thumb_filename = self._make_thumbnail_file(img_filename)
                 full_url = f"{self.valves.IMAGE_SERVER_URL}/{img_filename}"
                 thumb_url = f"{self.valves.IMAGE_SERVER_URL}/{thumb_filename}"
-                headers.append(f"p{page} · {source} ({score:.2f})")
+                score_str = f" ({score:.2f})" if score is not None else ""
+                headers.append(f"p{page} · {source}{score_str}")
                 divider.append(":---:")
                 images.append(f"[![p{page}]({thumb_url})]({full_url})")
         if not images:
@@ -408,7 +437,91 @@ class Pipeline:
             "| " + " | ".join(images)  + " |\n\n"
         )
 
-    def _stream_vlm(self, query: str, hits, cited: set):
+    def _check_adjacent_signal(self, cited_hits, query: str, first_pass_answer: str = "") -> set:
+        """Focused single-task VLM call: returns a set of (source, page_num) tuples
+        for pages that reference a figure/table that is (a) not on the same page
+        and (b) directly relevant to the query. Empty set = no expansion needed."""
+        import requests as _req
+
+        content_parts = []
+        page_labels = []  # track label → (source, page_num) mapping
+        for hit in cited_hits:
+            img_filename = hit.payload.get("image_filename", "")
+            pg = hit.payload.get("page_number", "?")
+            src = hit.payload.get("source", "?")
+            if img_filename:
+                img_b64 = self._load_page_image_b64(img_filename)
+                label = f"p{pg}"
+                page_labels.append((label, src, pg))
+                content_parts.append({"type": "text", "text": f"[{label} from {src}]"})
+                content_parts.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"},
+                })
+
+        if not content_parts:
+            return set()
+
+        labels_str = ", ".join(f"[{lbl}]" for lbl, _, _ in page_labels)
+        content_parts.append({
+            "type": "text",
+            "text": (
+                f"The user asked: {query!r}\n\n"
+                + (
+                    f"An answer was already generated from the cited pages:\n"
+                    f"{first_pass_answer[:600]}\n\n"
+                    if first_pass_answer else ""
+                ) +
+                "For each page shown above: does this page reference a Figure or "
+                "Table by number (e.g. 'Figure 15', 'Fig. 3-15', 'Table 2') that "
+                "is NOT shown on this page, AND whose content would substantially "
+                "improve or complete the answer above — not just add supplementary "
+                "detail, but provide information that is visibly MISSING from the "
+                "answer (e.g. timing values from a waveform, a schematic, circuit "
+                "diagram, or table of measurements that the text only partially describes)?\n\n"
+                "Do NOT flag a page if:\n"
+                "- The answer above already fully addresses the question\n"
+                "- The reference is to a Section/Chapter (text), not a Figure/Table\n"
+                "- The referenced figure/table adds only supplementary detail\n\n"
+                f"Reply with ONLY the page labels from {labels_str} that qualify, "
+                "comma-separated. If none qualify, reply: NONE."
+            ),
+        })
+
+        try:
+            resp = _req.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {self.valves.OPENROUTER_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": self.valves.OPENROUTER_MODEL,
+                    "messages": [{"role": "user", "content": content_parts}],
+                    "max_tokens": 50,
+                    "stream": False,
+                },
+                timeout=60,
+            )
+            resp.raise_for_status()
+            answer = resp.json()["choices"][0]["message"]["content"].strip()
+            log.info(f"Adjacent signal check → {answer!r}")
+
+            if "NONE" in answer.upper():
+                return set()
+
+            # Parse mentioned page labels back to (source, page_num) tuples
+            expand = set()
+            for label, src, pg in page_labels:
+                if label in answer:
+                    expand.add((src, pg))
+            log.info(f"Pages to expand adjacents for: {expand}")
+            return expand
+        except Exception as e:
+            log.warning(f"Adjacent signal check failed: {e}")
+            return set()
+
+    def _stream_vlm(self, query: str, hits, cited: set, supplementary: bool = False, supp_signal: list = None, first_pass_answer: str = ""):
         """Generator: stream OpenRouter SSE response, replacing [REF:N] inline."""
         import requests as _req
 
@@ -433,6 +546,35 @@ class Pipeline:
                     "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"},
                 })
 
+        if supplementary:
+            prev = f"The previous answer was:\n{first_pass_answer[:800]}\n\n" if first_pass_answer else ""
+            system_prompt = (
+                "You are supplementing a previous analysis of the user's document. "
+                f"{prev}"
+                "Additional adjacent pages have been retrieved. Extract and present any NEW "
+                "information from these pages that adds to the previous answer — especially "
+                "visual data (diagrams, timing waveforms, schematics, tables of measurements) "
+                "not fully captured in the text above. "
+                "Use [REF:N] citations. "
+                "If these pages contain NO new information relevant to the user's question, "
+                "respond with exactly `[NO_NEW_INFO]` and nothing else."
+            )
+        else:
+            system_prompt = (
+                "You are a helpful document assistant specializing in technical "
+                "documents such as wiring diagrams, schematics, and manuals. "
+                "You are given page images retrieved from the user's documents, "
+                "each labeled [REF:N]. "
+                "Answer the question using only information visible in these pages. "
+                "You MUST cite every claim inline using [REF:N] "
+                "(e.g. 'Power flows through fuse F53 [REF:2].'). "
+                "When tracing paths, circuits, or flows that span multiple pages, "
+                "explicitly connect the information across pages in sequence to "
+                "build a complete end-to-end answer. "
+                "Only cite pages you actually used. "
+                "If a page is irrelevant, do not cite it."
+            )
+
         with _req.post(
             "https://openrouter.ai/api/v1/chat/completions",
             headers={
@@ -442,23 +584,7 @@ class Pipeline:
             json={
                 "model": model,
                 "messages": [
-                    {
-                        "role": "system",
-                        "content": (
-                            "You are a helpful document assistant specializing in technical "
-                            "documents such as wiring diagrams, schematics, and manuals. "
-                            "You are given page images retrieved from the user's documents, "
-                            "each labeled [REF:N]. "
-                            "Answer the question using only information visible in these pages. "
-                            "You MUST cite every claim inline using [REF:N] "
-                            "(e.g. 'Power flows through fuse F53 [REF:2].'). "
-                            "When tracing paths, circuits, or flows that span multiple pages, "
-                            "explicitly connect the information across pages in sequence to "
-                            "build a complete end-to-end answer. "
-                            "Only cite pages you actually used. "
-                            "If a page is irrelevant, do not cite it."
-                        ),
-                    },
+                    {"role": "system", "content": system_prompt},
                     {"role": "user", "content": content_parts},
                 ],
                 "max_tokens": 2048,
@@ -497,12 +623,22 @@ class Pipeline:
                     open_pos = text.find('[', close_pos + 1)
 
                 text = self._expand_refs(text, hits, cited)
+                no_info_match = re.search(r'\[NO_NEW_INFO\]', text, re.IGNORECASE)
+                if no_info_match:
+                    if supp_signal is not None:
+                        supp_signal.append(True)
+                    text = re.sub(r'\[NO_NEW_INFO\]', '', text, flags=re.IGNORECASE)
                 if text:
                     yield text
 
             # Flush carry buffer
             if carry:
                 carry = self._expand_refs(carry, hits, cited)
+                no_info_match = re.search(r'\[NO_NEW_INFO\]', carry, re.IGNORECASE)
+                if no_info_match:
+                    if supp_signal is not None:
+                        supp_signal.append(True)
+                    carry = re.sub(r'\[NO_NEW_INFO\]', '', carry, flags=re.IGNORECASE)
                 if carry:
                     yield carry
 
@@ -537,16 +673,68 @@ class Pipeline:
                 lines.append(f">   - `{src}` p{pg} (score: {h.score:.2f})")
             yield "\n".join(lines) + "\n\n---\n\n"
 
-            # Step 3 — stream VLM answer
+            # Step 3 — stream VLM answer (collect text for the adjacent check)
             cited: set = set()
-            yield from self._stream_vlm(query, hits, cited)
+            first_pass_chunks = []
+            for chunk in self._stream_vlm(query, hits, cited):
+                first_pass_chunks.append(chunk)
+                yield chunk
+            first_pass_text = "".join(first_pass_chunks)
+
+            # Adjacent expansion — focused check returns only pages that need expansion
+            adjacent_hits = []
+            if self.valves.ADJACENT_PAGES > 0 and cited:
+                cited_hits_for_check = [hits[i] for i in sorted(cited) if i < len(hits)]
+                expand_pages = self._check_adjacent_signal(
+                    cited_hits_for_check, query, first_pass_answer=first_pass_text
+                )
+                if expand_pages:
+                    existing = {
+                        (hits[i].payload.get("source"), hits[i].payload.get("page_number"))
+                        for i in range(len(hits))
+                    }
+                    for i in sorted(cited):
+                        hit = hits[i]
+                        source = hit.payload.get("source", "")
+                        pg = hit.payload.get("page_number", 0)
+                        if (source, pg) not in expand_pages:
+                            continue  # skip pages that don't need expansion
+                        for adj in range(pg - self.valves.ADJACENT_PAGES,
+                                         pg + self.valves.ADJACENT_PAGES + 1):
+                            if adj == pg or adj < 1:
+                                continue
+                            if (source, adj) not in existing:
+                                pt = self._fetch_page(source, adj)
+                                if pt:
+                                    adjacent_hits.append(pt)
+                                    existing.add((source, adj))
+
+                if adjacent_hits:
+                    supp_signal: list = []
+                    supp_chunks: list = []
+                    for chunk in self._stream_vlm(query, adjacent_hits, set(),
+                                                   supplementary=True, supp_signal=supp_signal,
+                                                   first_pass_answer=first_pass_text):
+                        supp_chunks.append(chunk)
+
+                    if supp_signal:  # [NO_NEW_INFO] received — suppress entirely
+                        adjacent_hits = []
+                        log.info("Supplementary pass: no new info — suppressed")
+                    else:
+                        adj_list = ", ".join(
+                            f"{p.payload.get('source')} p{p.payload.get('page_number')}"
+                            for p in adjacent_hits
+                        )
+                        yield f"\n\n> 🔗 **Fetching {len(adjacent_hits)} adjacent page(s): {adj_list}**\n\n"
+                        for chunk in supp_chunks:
+                            yield chunk
 
             # Step 4 — source thumbnails
             if self.valves.SHOW_SOURCE_PAGES:
                 cited_hits = [hits[i] for i in sorted(cited) if i < len(hits)]
                 if not cited_hits:
                     cited_hits = hits  # fallback if model didn't use REF format
-                table = self._build_source_table(cited_hits)
+                table = self._build_source_table(cited_hits + adjacent_hits)
                 if table:
                     yield "\n\n---\n\n**📄 Source Pages:**\n\n" + table
 
