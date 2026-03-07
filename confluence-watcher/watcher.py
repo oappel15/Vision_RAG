@@ -190,7 +190,13 @@ def has_changed(watcher_state: dict, space_key: str, page_id: str, version: int)
     stored = watcher_state.get(space_key, {}).get(page_id)
     if stored is None:
         return True
-    return version > stored["version"]
+    if version > stored["version"]:
+        return True
+    # Re-render if the PDF was deleted externally (e.g. via pdf-ingest UI)
+    if not (PDF_DIR / stored["pdf_filename"]).exists():
+        log.info(f"PDF missing for {page_id} ({stored['pdf_filename']}) — will re-render")
+        return True
+    return False
 
 
 # ── PDF rendering ─────────────────────────────────────────────────────────────
