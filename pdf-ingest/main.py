@@ -5,6 +5,7 @@ No ML dependencies — purely file I/O + HTTP.
 """
 
 import json
+import logging
 import os
 import pathlib
 
@@ -12,6 +13,10 @@ import requests
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from qdrant_client import QdrantClient
+from qdrant_client.models import FieldCondition, Filter, FilterSelector, MatchValue
+
+log = logging.getLogger("pdf-ingest")
 
 app = FastAPI()
 
@@ -20,14 +25,17 @@ STATE_FILE = pathlib.Path(os.getenv("STATE_FILE", "/app/pipelines/pipeline_state
 PIPELINES_URL = os.getenv("PIPELINES_URL", "http://pipelines:9099")
 PIPELINES_API_KEY = os.getenv("PIPELINES_API_KEY", "0p3n-w3bu!")
 PIPELINE_MODEL = os.getenv("PIPELINE_MODEL", "colpali-pipeline")
+QDRANT_HOST = os.getenv("QDRANT_HOST", "qdrant")
+QDRANT_PORT = int(os.getenv("QDRANT_PORT", "6333"))
+COLLECTION_NAME = os.getenv("COLLECTION_NAME", "my_docs")
 
 PDF_DIR.mkdir(parents=True, exist_ok=True)
 
 app.mount("/pdfs", StaticFiles(directory=str(PDF_DIR)), name="pdfs")
 
 
-@app.get("/view/{filename}/{page}", response_class=HTMLResponse)
-def view_pdf_at_page(filename: str, page: int):
+@app.get("/view/{page}/{filename:path}", response_class=HTMLResponse)
+def view_pdf_at_page(page: int, filename: str):
     """Render a specific PDF page using PDF.js — no browser fragment support required."""
     return f"""<!DOCTYPE html>
 <html>
@@ -170,7 +178,24 @@ def delete_pdf(filename: str):
                 json.dump(state, f)
             os.replace(tmp, str(STATE_FILE))
 
-    return {"status": "deleted", "filename": filename}
+    # Remove vectors from Qdrant so stale embeddings don't persist
+    qdrant_ok = True
+    try:
+        qdrant = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
+        qdrant.delete(
+            collection_name=COLLECTION_NAME,
+            points_selector=FilterSelector(
+                filter=Filter(
+                    must=[FieldCondition(key="source", match=MatchValue(value=filename))]
+                )
+            ),
+        )
+        log.info(f"Qdrant vectors deleted for source={filename}")
+    except Exception as e:
+        qdrant_ok = False
+        log.error(f"Qdrant delete FAILED for {filename}: {e}")
+
+    return {"status": "deleted", "filename": filename, "qdrant_cleaned": qdrant_ok}
 
 
 @app.get("/", response_class=HTMLResponse)

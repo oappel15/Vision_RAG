@@ -41,9 +41,7 @@ class Pipeline:
         OPENROUTER_MODEL: str = "qwen/qwen3-vl-30b-a3b-instruct"
         # OPENROUTER_MODEL: str = "google/gemini-2.0-flash-001"
         SHOW_SOURCE_PAGES: bool = True
-        IMAGE_SERVER_URL: str = "http://localhost:8081"
-        PDF_SERVER_URL: str = "http://localhost:8082/pdfs"
-        PDF_VIEW_URL: str = "http://localhost:8082/view"
+        SERVER_HOST: str = os.getenv("SERVER_HOST", "localhost")
         IMAGE_CACHE_DIR: str = "/app/pipelines/cache/images"
 
     def __init__(self):
@@ -88,6 +86,10 @@ class Pipeline:
         img_filename = f"{safe_name}_p{page_num}.jpg"
         img_path = os.path.join(self.valves.IMAGE_CACHE_DIR, img_filename)
         page_img.save(img_path, format="JPEG", quality=85)
+        # Invalidate stale thumbnail so it gets regenerated on next query
+        thumb_path = img_path.replace(".jpg", "_thumb.jpg")
+        if os.path.exists(thumb_path):
+            os.remove(thumb_path)
         return img_filename
 
     def _load_page_image_b64(self, img_filename: str) -> str:
@@ -100,8 +102,12 @@ class Pipeline:
         """Create/cache thumbnail, return thumbnail filename."""
         thumb_filename = img_filename.replace(".jpg", "_thumb.jpg")
         thumb_path = os.path.join(self.valves.IMAGE_CACHE_DIR, thumb_filename)
-        if not os.path.exists(thumb_path):
-            src_path = os.path.join(self.valves.IMAGE_CACHE_DIR, img_filename)
+        src_path = os.path.join(self.valves.IMAGE_CACHE_DIR, img_filename)
+        stale = (
+            not os.path.exists(thumb_path)
+            or os.path.getmtime(src_path) > os.path.getmtime(thumb_path)
+        )
+        if stale:
             img = Image.open(src_path)
             ratio = max_width / img.width
             img = img.resize((max_width, int(img.height * ratio)), Image.LANCZOS)
@@ -138,7 +144,8 @@ class Pipeline:
             log.info("✓ ColQwen2 ready")
 
             self.qdrant = QdrantClient(
-                host=self.valves.QDRANT_HOST, port=self.valves.QDRANT_PORT
+                host=self.valves.QDRANT_HOST, port=self.valves.QDRANT_PORT,
+                timeout=60,
             )
             log.info(f"✓ Qdrant connected at {self.valves.QDRANT_HOST}:{self.valves.QDRANT_PORT}")
 
@@ -201,7 +208,7 @@ class Pipeline:
 
         collection = self.valves.COLLECTION_NAME
         pdf_dir = pathlib.Path(self.valves.PDF_DIR)
-        pdfs = sorted(pdf_dir.glob("*.pdf"))
+        pdfs = sorted(pdf_dir.rglob("*.pdf"))
         if not pdfs:
             log.warning(f"No PDFs found in {pdf_dir}")
             return
@@ -222,7 +229,7 @@ class Pipeline:
         file_progress = state.get("file_progress", {})
 
         # Include both unstarted and partially-indexed files
-        to_index = [p for p in pdfs if p.name not in indexed]
+        to_index = [p for p in pdfs if str(p.relative_to(pdf_dir)) not in indexed]
 
         if not to_index:
             log.info("All PDFs already indexed – skipping")
@@ -255,19 +262,20 @@ class Pipeline:
             if self._cancel_flag.is_set():
                 log.info("Indexing cancelled — stopping before next file")
                 break
+            rel = str(pdf_file.relative_to(pdf_dir))
             # Resume from the last completed page, or start from 1
-            start_page = file_progress.get(pdf_file.name, 0) + 1
-            log.info(f"  Indexing {pdf_file.name} (from page {start_page}) …")
-            global_page_id = self._ingest(pdf_file.name, collection, global_page_id, start_page)
+            start_page = file_progress.get(rel, 0) + 1
+            log.info(f"  Indexing {rel} (from page {start_page}) …")
+            global_page_id = self._ingest(rel, collection, global_page_id, start_page)
             if self._cancel_flag.is_set():
-                log.info(f"Indexing cancelled after {pdf_file.name}")
+                log.info(f"Indexing cancelled after {rel}")
                 break
             # Reload state before writing so sidecar deletions made during indexing are preserved
             state = self._load_state()
-            if pdf_file.name not in state.get("indexed_files", []):
-                state.setdefault("indexed_files", []).append(pdf_file.name)
+            if rel not in state.get("indexed_files", []):
+                state.setdefault("indexed_files", []).append(rel)
             state["schema_version"] = SCHEMA_VERSION
-            state.get("file_progress", {}).pop(pdf_file.name, None)
+            state.get("file_progress", {}).pop(rel, None)
             self._save_state(state)
 
         # Clear index_job on completion or cancellation
@@ -358,7 +366,7 @@ class Pipeline:
             collection_name=self.valves.COLLECTION_NAME,
             query=q_vecs,             # ← MULTI-VECTOR query
             limit=top_k,
-            search_params=SearchParams(exact=True),
+            search_params=SearchParams(exact=False),
             with_payload=True,
         ).points
 
@@ -376,7 +384,8 @@ class Pipeline:
                     hit = hits[idx]
                     pg = hit.payload.get("page_number", "?")
                     source = hit.payload.get("source", "")
-                    url = f"{self.valves.PDF_VIEW_URL}/{source}/{pg}" if source else ""
+                    base = f"http://{self.valves.SERVER_HOST}:8082/view"
+                    url = f"{base}/{pg}/{source}" if source else ""
                     parts.append(f"**[\\[Page {pg}\\]]({url})**" if url else f"Page {pg}")
             return " ".join(parts) if parts else m.group(0)
 
@@ -395,8 +404,11 @@ class Pipeline:
             score = hit.score
             if img_filename:
                 thumb_filename = self._make_thumbnail_file(img_filename)
-                full_url = f"{self.valves.IMAGE_SERVER_URL}/{img_filename}"
-                thumb_url = f"{self.valves.IMAGE_SERVER_URL}/{thumb_filename}"
+                img_base = f"http://{self.valves.SERVER_HOST}:8081"
+                full_url = f"{img_base}/{img_filename}"
+                thumb_path = os.path.join(self.valves.IMAGE_CACHE_DIR, thumb_filename)
+                mtime = int(os.path.getmtime(thumb_path)) if os.path.exists(thumb_path) else 0
+                thumb_url = f"{img_base}/{thumb_filename}?v={mtime}"
                 headers.append(f"p{page} · {source} ({score:.2f})")
                 divider.append(":---:")
                 images.append(f"[![p{page}]({thumb_url})]({full_url})")
@@ -445,18 +457,19 @@ class Pipeline:
                     {
                         "role": "system",
                         "content": (
-                            "You are a helpful document assistant specializing in technical "
-                            "documents such as wiring diagrams, schematics, and manuals. "
-                            "You are given page images retrieved from the user's documents, "
+                            "You are a document assistant. "
+                            "You are given page images from the user's document collection, "
                             "each labeled [REF:N]. "
-                            "Answer the question using only information visible in these pages. "
-                            "You MUST cite every claim inline using [REF:N] "
-                            "(e.g. 'Power flows through fuse F53 [REF:2].'). "
-                            "When tracing paths, circuits, or flows that span multiple pages, "
-                            "explicitly connect the information across pages in sequence to "
-                            "build a complete end-to-end answer. "
-                            "Only cite pages you actually used. "
-                            "If a page is irrelevant, do not cite it."
+                            "RULES — follow these exactly:\n"
+                            "1. Answer using ONLY information visible in the provided pages.\n"
+                            "2. Every factual claim MUST be followed immediately by its inline "
+                            "citation in the form [REF:N] — no exceptions "
+                            "(example: 'The range is 340 miles [REF:2].').\n"
+                            "3. Only cite a page if you actually used information from it. "
+                            "Do NOT cite pages whose content is irrelevant to the answer.\n"
+                            "4. If information spans multiple pages, chain citations as needed "
+                            "(example: 'Connect A to B [REF:1], then B to C [REF:3].').\n"
+                            "5. If none of the pages contain relevant information, say so plainly."
                         ),
                     },
                     {"role": "user", "content": content_parts},
@@ -541,11 +554,9 @@ class Pipeline:
             cited: set = set()
             yield from self._stream_vlm(query, hits, cited)
 
-            # Step 4 — source thumbnails
+            # Step 4 — source thumbnails (only cited pages)
             if self.valves.SHOW_SOURCE_PAGES:
                 cited_hits = [hits[i] for i in sorted(cited) if i < len(hits)]
-                if not cited_hits:
-                    cited_hits = hits  # fallback if model didn't use REF format
                 table = self._build_source_table(cited_hits)
                 if table:
                     yield "\n\n---\n\n**📄 Source Pages:**\n\n" + table
@@ -731,14 +742,14 @@ class Pipeline:
 
 #     def _index_local_pdfs(self):
 #         pdf_dir = pathlib.Path(self.valves.PDF_DIR)
-#         pdfs = sorted(pdf_dir.glob("*.pdf"))
+#         pdfs = sorted(pdf_dir.rglob("*.pdf"))
 #         if not pdfs:
 #             log.warning(f"No PDFs found in {pdf_dir}")
 #             return
 
 #         state = self._load_state()
 #         indexed = set(state.get("indexed_files", []))
-#         to_index = [p for p in pdfs if p.name not in indexed]
+#         to_index = [p for p in pdfs if str(p.relative_to(pdf_dir)) not in indexed]
 
 #         if not to_index:
 #             log.info("All PDFs already indexed – skipping")
