@@ -9,7 +9,7 @@ description: Visual RAG pipeline using ColQwen2 multi-vector MaxSim + Qdrant + O
 
 import asyncio
 import os, json, base64, io, logging, pathlib, hashlib, re, threading
-from typing import List, Optional
+from typing import List, Literal, Optional
 
 import torch
 from PIL import Image
@@ -38,8 +38,7 @@ class Pipeline:
         TOP_K: int = 8
         SCORE_THRESHOLD: float = 0.0
         # ── VLM backend ── set VLM_PROVIDER to "ollama" to use local Ollama instead
-        VLM_PROVIDER: str = "openrouter"          # "openrouter" | "ollama"
-        OPENROUTER_API_KEY: str = ""
+        VLM_PROVIDER: Literal["openrouter", "ollama"] = "openrouter"
         OPENROUTER_MODEL: str = "qwen/qwen3-vl-30b-a3b-instruct"
         OLLAMA_BASE_URL: str = os.getenv("OLLAMA_BASE_URL", "http://ollama:11434")
         OLLAMA_VLM_MODEL: str = "qwen3-vl:30b-a3b-instruct"  # model must be pulled in Ollama first
@@ -126,9 +125,6 @@ class Pipeline:
 
         log.info("=== Model loading starting ===")
 
-        self.valves.OPENROUTER_API_KEY = os.getenv(
-            "OPENROUTER_API_KEY", self.valves.OPENROUTER_API_KEY
-        )
         self.valves.OPENROUTER_MODEL = os.getenv(
             "OPENROUTER_MODEL", self.valves.OPENROUTER_MODEL
         )
@@ -438,9 +434,9 @@ class Pipeline:
             headers = {"Content-Type": "application/json"}
             model = self.valves.OLLAMA_VLM_MODEL
         else:  # openrouter (default)
-            api_key = self.valves.OPENROUTER_API_KEY
+            api_key = os.getenv("OPENROUTER_API_KEY", "")
             if not api_key:
-                yield "Error: OPENROUTER_API_KEY not set."
+                yield "Error: OPENROUTER_API_KEY not set in .env."
                 return
             url = "https://openrouter.ai/api/v1/chat/completions"
             headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}

@@ -14,7 +14,6 @@ Install on the new machine before anything else:
 | **Docker Desktop** | Includes Docker Compose. Enable WSL2 backend in settings. |
 | **WSL2** (Windows) | Ubuntu distro recommended. Docker Desktop integrates with it automatically. |
 | **Git** | To clone the repo |
-| **Python 3.x** | Only needed if you run local scripts — not required for Docker-only setup |
 
 Docker Desktop automatically forwards container ports to the Windows LAN IP — no manual port-forwarding or `netsh` configuration needed.
 
@@ -31,26 +30,29 @@ cd Vision_RAG
 
 ## 2. Create `.env`
 
-Copy `.env.example` to `.env` (or create from scratch). The file must live in the project root.
+Create `.env` in the project root. This file holds all secrets and machine-specific config — it is gitignored and never committed.
 
 ```env
-# Required — get from https://openrouter.ai
+# ── VLM backend ───────────────────────────────────────────────────────────────
+# Required if using OpenRouter (cloud VLM). Get a key at https://openrouter.ai
 OPENROUTER_API_KEY=sk-or-v1-...
 
-# Required if using Confluence watcher — generate a PAT in Confluence:
-# Profile → Settings → Personal Access Tokens → Create token
+# ── Confluence watcher (optional) ────────────────────────────────────────────
+# Generate a PAT in Confluence: Profile → Settings → Personal Access Tokens
 CONFLUENCE_PAT=<your-confluence-personal-access-token>
 
-# How often the Confluence watcher polls for changes (seconds)
+# How often the watcher polls for changes (seconds)
 CONFLUENCE_POLL_INTERVAL=60
 
-# The LAN IP of this machine — used as the startup default for SERVER_HOST valve
-# Find it: ip route get 1 | awk '{print $7; exit}' (Linux/WSL2)
-#          ipconfig (Windows, look for IPv4 Address)
+# ── LAN access ────────────────────────────────────────────────────────────────
+# This machine's LAN IP — used as the startup default for SERVER_HOST valve.
+# Find it: ip route get 1 | awk '{print $7; exit}'   (Linux/WSL2)
+#          ipconfig                                    (Windows → IPv4 Address)
 HOST_IP=<this-machine-lan-ip>
 ```
 
-> **Note:** `HOST_IP` is only the startup default. You can override it live in the Open WebUI pipeline settings after startup (see Step 5).
+> **Note:** `OPENROUTER_API_KEY` is read exclusively from `.env` — it does not appear in the pipeline UI valves.
+> `HOST_IP` is only the startup default for `SERVER_HOST`. You can override it live in the pipeline settings (see Step 5).
 
 ---
 
@@ -92,9 +94,11 @@ Open **`http://<HOST_IP>:3000`** in a browser.
 2. Go to **Settings → Admin → Pipelines**
 3. Find **ColQwen2 Visual RAG** and click the settings icon
 4. Set **`SERVER_HOST`** to this machine's LAN IP (e.g. `10.0.1.5`)
-   - This controls where browsers fetch thumbnails (port 8081) and PDFs (port 8082)
+   - Controls where browsers fetch thumbnails (port 8081) and PDFs (port 8082)
    - Use `localhost` if you only need single-machine access
-5. Set **`OPENROUTER_API_KEY`** if it wasn't picked up from `.env`
+5. Set **`VLM_PROVIDER`** using the dropdown: `openrouter` (cloud) or `ollama` (local GPU)
+   - For `openrouter`: ensure `OPENROUTER_API_KEY` is set in `.env` (not in valves)
+   - For `ollama`: see [Switching VLM Backend](#switching-vlm-backend-openrouter--local-ollama) below
 6. Save
 
 > **Moving to a new LAN?** Only `SERVER_HOST` needs updating — change it here and all image/citation links adapt immediately with no restart.
@@ -148,12 +152,14 @@ Configure `CONFLUENCE_URL` and `CONFLUENCE_PAT` in `.env`. The watcher polls eve
 
 | File | Purpose |
 |---|---|
-| `.env` | Secrets and machine-specific config |
-| `pipelines/colpali-pipeline/valves.json` | Persisted pipeline valve settings |
-| `pipelines/pipeline_state.json` | Tracks which PDFs are indexed |
+| `.env` | Secrets and machine-specific config (gitignored) |
+| `pipelines/colpali-pipeline/valves.json` | Persisted pipeline valve settings (gitignored) |
+| `pipelines/pipeline_state.json` | Runtime index state — which PDFs are indexed (gitignored) |
 | `my-pdfs/` | PDF source directory (indexed automatically) |
 | `pipelines/cache/images/` | Cached page images and thumbnails |
 | `confluence-watcher/watcher_state.json` | Tracks Confluence page versions |
+
+> All three gitignored files are created automatically at runtime — do not copy them between machines.
 
 ---
 
@@ -196,7 +202,7 @@ Open `.env` and set:
 CONFLUENCE_PAT=<paste-your-token-here>
 ```
 
-Full example `.env` with Confluence configured:
+Full example `.env`:
 
 ```env
 OPENROUTER_API_KEY=sk-or-v1-...
@@ -262,7 +268,7 @@ docker exec -it ollama ollama list
 ### Step 2 — Switch the VLM_PROVIDER valve in Open WebUI
 
 1. Open WebUI → **Settings → Admin → Pipelines → ColQwen2 Visual RAG**
-2. Set **`VLM_PROVIDER`** → `ollama`
+2. Set **`VLM_PROVIDER`** → `ollama` (dropdown)
 3. Confirm **`OLLAMA_VLM_MODEL`** matches the pulled model name (default: `qwen3-vl:30b-a3b-instruct`)
 4. **`OLLAMA_BASE_URL`** should already be `http://ollama:11434` (no change needed)
 5. Save — takes effect immediately, no restart needed
@@ -274,7 +280,7 @@ Check Ollama logs to confirm: `docker logs ollama -f`
 
 ### Switching back to OpenRouter
 
-Set **`VLM_PROVIDER`** back to `openrouter` in the pipeline valves. Ensure `OPENROUTER_API_KEY` is set in `.env` or the valve.
+Set **`VLM_PROVIDER`** back to `openrouter` in the pipeline valves. Ensure `OPENROUTER_API_KEY` is set in `.env`.
 
 ---
 
@@ -294,3 +300,6 @@ The watcher uses `--host-resolver-rules` to navigate Chromium to `localhost:<por
 
 **First query after restart is slow:**
 ColQwen2 loads at startup but needs ~60s. The pipeline returns `"Pipeline initializing"` until ready.
+
+**Everything re-indexes from scratch after a restart:**
+`pipeline_state.json` is gitignored runtime state — do not copy it between machines or restore it from git. If it gets corrupted or lost, the pipeline will re-index all PDFs automatically (which is correct behavior on a fresh machine).
