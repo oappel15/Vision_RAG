@@ -42,7 +42,7 @@ class Pipeline:
         OPENROUTER_API_KEY: str = ""
         OPENROUTER_MODEL: str = "qwen/qwen3-vl-30b-a3b-instruct"
         OLLAMA_BASE_URL: str = os.getenv("OLLAMA_BASE_URL", "http://ollama:11434")
-        OLLAMA_VLM_MODEL: str = "qwen3-vl:30b"   # model must be pulled in Ollama first
+        OLLAMA_VLM_MODEL: str = "qwen3-vl:30b-a3b-instruct"  # model must be pulled in Ollama first
         SHOW_SOURCE_PAGES: bool = True
         SERVER_HOST: str = os.getenv("SERVER_HOST", "localhost")
         IMAGE_CACHE_DIR: str = "/app/pipelines/cache/images"

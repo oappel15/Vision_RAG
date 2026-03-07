@@ -243,14 +243,14 @@ By default the pipeline sends page images to **OpenRouter** (cloud). On a machin
 
 | Item | Detail |
 |---|---|
-| GPU VRAM | ~24 GB for `qwen3-vl:30b` (e.g. RTX 3090 / 4090 / A100) |
+| GPU VRAM | ~24 GB for `qwen3-vl:30b-a3b-instruct` (e.g. RTX 3090 / 4090 / A100) |
 | Ollama | Already included as a service in `docker-compose.yml` |
 | Model pulled | Must pull the model before switching |
 
 ### Step 1 — Pull the model into Ollama
 
 ```bash
-docker exec -it ollama ollama pull qwen3-vl:30b
+docker exec -it ollama ollama pull qwen3-vl:30b-a3b-instruct
 ```
 
 This downloads ~20 GB on first run. Check progress:
@@ -263,7 +263,7 @@ docker exec -it ollama ollama list
 
 1. Open WebUI → **Settings → Admin → Pipelines → ColQwen2 Visual RAG**
 2. Set **`VLM_PROVIDER`** → `ollama`
-3. Confirm **`OLLAMA_VLM_MODEL`** matches the pulled model name (default: `qwen3-vl:30b`)
+3. Confirm **`OLLAMA_VLM_MODEL`** matches the pulled model name (default: `qwen3-vl:30b-a3b-instruct`)
 4. **`OLLAMA_BASE_URL`** should already be `http://ollama:11434` (no change needed)
 5. Save — takes effect immediately, no restart needed
 
