@@ -41,6 +41,14 @@ OPENROUTER_API_KEY=sk-or-v1-...
 # Generate a PAT in Confluence: Profile → Settings → Personal Access Tokens
 CONFLUENCE_PAT=<your-confluence-personal-access-token>
 
+# Confluence server URL — use the externally reachable address of the server
+# If Confluence is on the same machine as Docker: http://host.docker.internal:8090
+# If Confluence is on a separate server:          http://confluence.yourcompany.com
+CONFLUENCE_URL=http://confluence.yourcompany.com
+
+# Comma-separated Space Keys to index (visible in Confluence: Space Settings → Space Key)
+CONFLUENCE_SPACES=RAG,ENG
+
 # How often the watcher polls for changes (seconds)
 CONFLUENCE_POLL_INTERVAL=60
 
@@ -207,6 +215,8 @@ Full example `.env`:
 ```env
 OPENROUTER_API_KEY=sk-or-v1-...
 CONFLUENCE_PAT=NDYzNTExNzk2NTU0OgN...
+CONFLUENCE_URL=http://confluence.yourcompany.com
+CONFLUENCE_SPACES=RAG,ENG
 CONFLUENCE_POLL_INTERVAL=60
 HOST_IP=10.0.1.5
 ```
@@ -217,17 +227,18 @@ HOST_IP=10.0.1.5
 
 ### Step C — Configure the target Confluence spaces
 
-Edit `docker-compose.yml` under the `confluence-watcher` service to point at your instance:
+Set `CONFLUENCE_URL` and `CONFLUENCE_SPACES` in `.env`:
 
-```yaml
-environment:
-  - CONFLUENCE_URL=http://host.docker.internal:8090   # adjust port if needed
-  - CONFLUENCE_SPACES=RAG,ENG                         # comma-separated space keys
+```env
+# Confluence hosted by an external team on a separate server:
+CONFLUENCE_URL=http://confluence.yourcompany.com
+
+# Comma-separated Space Keys to index
+CONFLUENCE_SPACES=RAG,ENG
 ```
 
-- `host.docker.internal` resolves to the Windows host from inside Docker — use this if Confluence runs on the same machine
-- If Confluence runs on a **different server**, replace with its IP: `http://192.168.1.50:8090`
-- `CONFLUENCE_SPACES` — the Space Keys of the spaces to index (visible in Space Settings → Space Key in Confluence)
+- Space Keys are visible in Confluence under **Space Settings → Space Key**
+- If Confluence happens to run on the same machine as Docker, use `http://host.docker.internal:8090`
 
 ---
 

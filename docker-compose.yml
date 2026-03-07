@@ -79,7 +79,7 @@ services:
     build: ./confluence-watcher
     container_name: confluence-watcher
     environment:
-      - CONFLUENCE_URL=http://host.docker.internal:8090
+      - CONFLUENCE_URL=${CONFLUENCE_URL:-http://host.docker.internal:8090}
       - CONFLUENCE_PAT=${CONFLUENCE_PAT}
       - CONFLUENCE_SPACES=${CONFLUENCE_SPACES:-RAG}
       - QDRANT_HOST=qdrant
