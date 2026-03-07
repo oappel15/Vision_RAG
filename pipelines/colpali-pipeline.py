@@ -37,9 +37,12 @@ class Pipeline:
         COLLECTION_NAME: str = "target_knowledge"
         TOP_K: int = 8
         SCORE_THRESHOLD: float = 0.0
+        # ── VLM backend ── set VLM_PROVIDER to "ollama" to use local Ollama instead
+        VLM_PROVIDER: str = "openrouter"          # "openrouter" | "ollama"
         OPENROUTER_API_KEY: str = ""
         OPENROUTER_MODEL: str = "qwen/qwen3-vl-30b-a3b-instruct"
-        # OPENROUTER_MODEL: str = "google/gemini-2.0-flash-001"
+        OLLAMA_BASE_URL: str = os.getenv("OLLAMA_BASE_URL", "http://ollama:11434")
+        OLLAMA_VLM_MODEL: str = "qwen2.5vl:30b"  # model must be pulled in Ollama first
         SHOW_SOURCE_PAGES: bool = True
         SERVER_HOST: str = os.getenv("SERVER_HOST", "localhost")
         IMAGE_CACHE_DIR: str = "/app/pipelines/cache/images"
@@ -421,14 +424,27 @@ class Pipeline:
         )
 
     def _stream_vlm(self, query: str, hits, cited: set):
-        """Generator: stream OpenRouter SSE response, replacing [REF:N] inline."""
+        """Generator: stream VLM SSE response, replacing [REF:N] inline.
+        Supports two backends selected by the VLM_PROVIDER valve:
+          - "openrouter"  : cloud API via openrouter.ai (requires OPENROUTER_API_KEY)
+          - "ollama"      : local Ollama instance (requires model pulled, no API key)
+        """
         import requests as _req
 
-        api_key = self.valves.OPENROUTER_API_KEY
-        model = self.valves.OPENROUTER_MODEL
-        if not api_key:
-            yield "Error: OPENROUTER_API_KEY not set."
-            return
+        provider = self.valves.VLM_PROVIDER.lower()
+
+        if provider == "ollama":
+            url = f"{self.valves.OLLAMA_BASE_URL}/v1/chat/completions"
+            headers = {"Content-Type": "application/json"}
+            model = self.valves.OLLAMA_VLM_MODEL
+        else:  # openrouter (default)
+            api_key = self.valves.OPENROUTER_API_KEY
+            if not api_key:
+                yield "Error: OPENROUTER_API_KEY not set."
+                return
+            url = "https://openrouter.ai/api/v1/chat/completions"
+            headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+            model = self.valves.OPENROUTER_MODEL
 
         content_parts = [{"type": "text", "text": query}]
         for i, hit in enumerate(hits, 1):
@@ -446,11 +462,8 @@ class Pipeline:
                 })
 
         with _req.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
+            url,
+            headers=headers,
             json={
                 "model": model,
                 "messages": [

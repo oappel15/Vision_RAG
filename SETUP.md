@@ -235,6 +235,49 @@ The watcher polls on startup and then every `CONFLUENCE_POLL_INTERVAL` seconds. 
 
 ---
 
+## Switching VLM Backend: OpenRouter → Local Ollama
+
+By default the pipeline sends page images to **OpenRouter** (cloud). On a machine with a capable GPU you can switch to a **local Ollama** instance instead — no internet required, no API key needed.
+
+### Requirements
+
+| Item | Detail |
+|---|---|
+| GPU VRAM | ~24 GB for `qwen2.5vl:30b` (e.g. RTX 3090 / 4090 / A100) |
+| Ollama | Already included as a service in `docker-compose.yml` |
+| Model pulled | Must pull the model before switching |
+
+### Step 1 — Pull the model into Ollama
+
+```bash
+docker exec -it ollama ollama pull qwen2.5vl:30b
+```
+
+This downloads ~20 GB on first run. Check progress:
+
+```bash
+docker exec -it ollama ollama list
+```
+
+### Step 2 — Switch the VLM_PROVIDER valve in Open WebUI
+
+1. Open WebUI → **Settings → Admin → Pipelines → ColQwen2 Visual RAG**
+2. Set **`VLM_PROVIDER`** → `ollama`
+3. Confirm **`OLLAMA_VLM_MODEL`** matches the pulled model name (default: `qwen2.5vl:30b`)
+4. **`OLLAMA_BASE_URL`** should already be `http://ollama:11434` (no change needed)
+5. Save — takes effect immediately, no restart needed
+
+### Step 3 — Verify
+
+Ask a question in Open WebUI. The answer should come back without any OpenRouter API calls.
+Check Ollama logs to confirm: `docker logs ollama -f`
+
+### Switching back to OpenRouter
+
+Set **`VLM_PROVIDER`** back to `openrouter` in the pipeline valves. Ensure `OPENROUTER_API_KEY` is set in `.env` or the valve.
+
+---
+
 ## Troubleshooting
 
 **Pipeline times out on search:**
