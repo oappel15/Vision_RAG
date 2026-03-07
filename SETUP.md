@@ -160,24 +160,78 @@ Configure `CONFLUENCE_URL` and `CONFLUENCE_PAT` in `.env`. The watcher polls eve
 ## Confluence Watcher Setup
 
 The watcher renders Confluence pages to PDF and indexes them automatically.
+Any Confluence user account with read access to the target spaces is sufficient — admin rights are not required.
 
-**Requirements:**
-- Confluence Server (tested with v8.x) accessible from Docker
-- Personal Access Token with read access to target spaces
+---
 
-**Environment variables** (in `.env`):
+### Step A — Generate a Personal Access Token (PAT) in Confluence
+
+1. Log in to your Confluence Server instance
+2. Click your **profile avatar** (top-right corner)
+3. Go to **Profile → Settings** (left sidebar)
+4. Click **Personal Access Tokens** in the left menu
+5. Click **Create token**
+6. Give it a name (e.g. `vision-rag-watcher`), set expiry if required, click **Create**
+7. **Copy the token immediately** — it is only shown once
+
+> PATs are available on Confluence Server **7.9 and later**. If your instance is older, contact the admin to enable basic auth and adjust the watcher's `_auth_headers()` function to use `Authorization: Basic base64(user:password)`.
+
+---
+
+### Step B — Add the PAT to `.env`
+
+The `.env` file lives in the **project root directory**:
+
+```
+Vision_RAG/          ← project root
+├── .env             ← put CONFLUENCE_PAT here
+├── docker-compose.yml
+├── confluence-watcher/
+└── ...
+```
+
+Open `.env` and set:
+
 ```env
-CONFLUENCE_PAT=<token>
-CONFLUENCE_POLL_INTERVAL=60   # seconds between polls
+CONFLUENCE_PAT=<paste-your-token-here>
 ```
 
-**Docker Compose environment** (already set in `docker-compose.yml`):
+Full example `.env` with Confluence configured:
+
+```env
+OPENROUTER_API_KEY=sk-or-v1-...
+CONFLUENCE_PAT=NDYzNTExNzk2NTU0OgN...
+CONFLUENCE_POLL_INTERVAL=60
+HOST_IP=10.0.1.5
+```
+
+> `.env` is gitignored — it never gets committed. Keep it on the machine only.
+
+---
+
+### Step C — Configure the target Confluence spaces
+
+Edit `docker-compose.yml` under the `confluence-watcher` service to point at your instance:
+
 ```yaml
-CONFLUENCE_URL: http://host.docker.internal:8090   # adjust port if needed
-CONFLUENCE_SPACES: RAG                              # comma-separated space keys
+environment:
+  - CONFLUENCE_URL=http://host.docker.internal:8090   # adjust port if needed
+  - CONFLUENCE_SPACES=RAG,ENG                         # comma-separated space keys
 ```
 
-> `host.docker.internal` resolves to the Windows host from inside Docker. If Confluence runs on a different machine, use its IP directly.
+- `host.docker.internal` resolves to the Windows host from inside Docker — use this if Confluence runs on the same machine
+- If Confluence runs on a **different server**, replace with its IP: `http://192.168.1.50:8090`
+- `CONFLUENCE_SPACES` — the Space Keys of the spaces to index (visible in Space Settings → Space Key in Confluence)
+
+---
+
+### Step D — Restart the watcher
+
+```bash
+docker compose up -d confluence-watcher
+```
+
+The watcher polls on startup and then every `CONFLUENCE_POLL_INTERVAL` seconds. On first run with a fresh state it indexes all pages in the configured spaces automatically.
 
 ---
 
