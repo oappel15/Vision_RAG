@@ -40,6 +40,7 @@ class Pipeline:
         # ── VLM backend ── set VLM_PROVIDER to "ollama" to use local Ollama instead
         VLM_PROVIDER: Literal["openrouter", "ollama"] = "openrouter"
         OPENROUTER_MODEL: str = "qwen/qwen3-vl-30b-a3b-instruct"
+        THUMBNAIL_SCORE_THRESHOLD: float = 0.0  # min score for cited page to show thumbnail; 0 = show all
         OLLAMA_BASE_URL: str = os.getenv("OLLAMA_BASE_URL", "http://ollama:11434")
         OLLAMA_VLM_MODEL: str = "qwen3-vl:30b-a3b-instruct"  # model must be pulled in Ollama first
         SHOW_SOURCE_PAGES: bool = True
@@ -56,6 +57,8 @@ class Pipeline:
         self._index_lock = threading.Lock()
         self._index_thread: threading.Thread = None
         self._cancel_flag = threading.Event()
+        self._cancel_hard = threading.Event()   # hard cancel: clears progress + Qdrant vectors
+        self._current_indexing_file: str = None
 
     async def on_startup(self):
         log.info("on_startup: loading model eagerly in executor …")
@@ -172,6 +175,8 @@ class Pipeline:
 
     def _background_index_worker(self):
         self._cancel_flag.clear()
+        self._cancel_hard.clear()
+        self._current_indexing_file = None
         with self._index_lock:
             try:
                 self._index_local_pdfs()
@@ -225,10 +230,12 @@ class Pipeline:
             self._save_state(state)
 
         indexed = set(state.get("indexed_files", []))
+        skipped = set(state.get("skipped_files", []))
         file_progress = state.get("file_progress", {})
 
-        # Include both unstarted and partially-indexed files
-        to_index = [p for p in pdfs if str(p.relative_to(pdf_dir)) not in indexed]
+        # Include both unstarted and partially-indexed files; exclude hard-cancelled files
+        to_index = [p for p in pdfs if str(p.relative_to(pdf_dir)) not in indexed
+                    and str(p.relative_to(pdf_dir)) not in skipped]
 
         if not to_index:
             log.info("All PDFs already indexed – skipping")
@@ -262,6 +269,7 @@ class Pipeline:
                 log.info("Indexing cancelled — stopping before next file")
                 break
             rel = str(pdf_file.relative_to(pdf_dir))
+            self._current_indexing_file = rel
             # Resume from the last completed page, or start from 1
             start_page = file_progress.get(rel, 0) + 1
             log.info(f"  Indexing {rel} (from page {start_page}) …")
@@ -279,12 +287,33 @@ class Pipeline:
 
         # Clear index_job on completion or cancellation
         state = self._load_state()
-        state["index_job"] = {}
-        self._save_state(state)
         if self._cancel_flag.is_set():
-            log.info("Indexing cancelled — partial progress checkpointed, will resume on next run")
+            if self._cancel_hard.is_set():
+                # Hard cancel: wipe progress + partial Qdrant vectors + mark as skipped
+                current_file = self._current_indexing_file
+                if current_file:
+                    state.get("file_progress", {}).pop(current_file, None)
+                    try:
+                        self.qdrant.delete(
+                            collection_name=collection,
+                            points_selector=FilterSelector(
+                                filter=Filter(must=[FieldCondition(key="source", match=MatchValue(value=current_file))])
+                            ),
+                        )
+                        log.info(f"Hard cancel: deleted partial Qdrant vectors for {current_file}")
+                    except Exception as e:
+                        log.warning(f"Hard cancel: Qdrant cleanup failed for {current_file}: {e}")
+                    # Add to skip list so __index_now__ won't restart this file automatically
+                    skipped_list = state.setdefault("skipped_files", [])
+                    if current_file not in skipped_list:
+                        skipped_list.append(current_file)
+                    log.info(f"Hard cancel complete — {current_file} added to skip list")
+            else:
+                log.info("Pause — partial progress checkpointed, will resume on next run")
         else:
             log.info("✓ All PDFs indexed")
+        state["index_job"] = {}
+        self._save_state(state)
 
     def _ingest(self, filename: str, collection: str, start_id: int, start_page: int = 1) -> int:
         from pdf2image import pdfinfo_from_path
@@ -474,8 +503,8 @@ class Pipeline:
                             "2. Every factual claim MUST be followed immediately by its inline "
                             "citation in the form [REF:N] — no exceptions "
                             "(example: 'The range is 340 miles [REF:2].').\n"
-                            "3. Only cite a page if you actually used information from it. "
-                            "Do NOT cite pages whose content is irrelevant to the answer.\n"
+                            "3. Only cite a page if it DIRECTLY provides key information used in your answer. "
+                            "Do NOT cite pages that are only tangentially related, background context, or marginally mentioned.\n"
                             "4. If information spans multiple pages, chain citations as needed "
                             "(example: 'Connect A to B [REF:1], then B to C [REF:3].').\n"
                             "5. If none of the pages contain relevant information, say so plainly."
@@ -563,9 +592,11 @@ class Pipeline:
             cited: set = set()
             yield from self._stream_vlm(query, hits, cited)
 
-            # Step 4 — source thumbnails (only cited pages)
+            # Step 4 — source thumbnails (only cited pages above score threshold)
             if self.valves.SHOW_SOURCE_PAGES:
                 cited_hits = [hits[i] for i in sorted(cited) if i < len(hits)]
+                if self.valves.THUMBNAIL_SCORE_THRESHOLD > 0:
+                    cited_hits = [h for h in cited_hits if h.score >= self.valves.THUMBNAIL_SCORE_THRESHOLD]
                 table = self._build_source_table(cited_hits)
                 if table:
                     yield "\n\n---\n\n**📄 Source Pages:**\n\n" + table
@@ -593,8 +624,14 @@ class Pipeline:
             return "__ok__"
 
         if query.strip() == "__cancel_index__":
+            self._cancel_hard.set()
             self._cancel_flag.set()
-            log.info("Cancellation flag set — indexing will stop at next page boundary")
+            log.info("Hard cancel — indexing will stop, progress cleared, partial vectors removed")
+            return "__ok__"
+
+        if query.strip() == "__pause_index__":
+            self._cancel_flag.set()
+            log.info("Pause — indexing will stop, progress saved for resume")
             return "__ok__"
 
         # User status query

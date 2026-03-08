@@ -22,6 +22,7 @@ app = FastAPI()
 
 PDF_DIR = pathlib.Path(os.getenv("PDF_DIR", "/app/downloads"))
 STATE_FILE = pathlib.Path(os.getenv("STATE_FILE", "/app/pipelines/pipeline_state.json"))
+WATCHER_STATE_FILE = pathlib.Path(os.getenv("WATCHER_STATE_FILE", "/app/watcher_state/watcher_state.json"))
 PIPELINES_URL = os.getenv("PIPELINES_URL", "http://pipelines:9099")
 PIPELINES_API_KEY = os.getenv("PIPELINES_API_KEY", "0p3n-w3bu!")
 PIPELINE_MODEL = os.getenv("PIPELINE_MODEL", "colpali-pipeline")
@@ -112,6 +113,20 @@ async def upload_pdf(file: UploadFile = File(...)):
     with open(dest, "wb") as f:
         f.write(content)
 
+    # Clear skip flag so a re-uploaded previously-cancelled file gets indexed
+    if STATE_FILE.exists():
+        try:
+            with open(STATE_FILE) as f:
+                state = json.load(f)
+            if file.filename in state.get("skipped_files", []):
+                state["skipped_files"].remove(file.filename)
+                tmp = str(STATE_FILE) + ".tmp"
+                with open(tmp, "w") as f:
+                    json.dump(state, f)
+                os.replace(tmp, str(STATE_FILE))
+        except Exception:
+            pass
+
     # Fire-and-forget: trigger background indexing via existing pipeline API
     try:
         requests.post(
@@ -140,24 +155,61 @@ def get_status():
     return JSONResponse({})
 
 
-@app.post("/cancel")
-def cancel_indexing():
+@app.get("/queue")
+def get_queue():
+    """Return files waiting to be indexed (queued + paused), ordered as the indexer would pick them."""
+    state = {}
+    if STATE_FILE.exists():
+        try:
+            with open(STATE_FILE) as f:
+                state = json.load(f)
+        except Exception:
+            pass
+
+    indexed = set(state.get("indexed_files", []))
+    skipped = set(state.get("skipped_files", []))
+    file_progress = state.get("file_progress", {})
+    job = state.get("index_job", {})
+    active_file = job.get("current_file") if job.get("active") else None
+
+    queue = []
+    for pdf in sorted(PDF_DIR.rglob("*.pdf")):
+        rel = str(pdf.relative_to(PDF_DIR))
+        if rel in indexed or rel in skipped:
+            continue
+        if rel == active_file:
+            continue  # already shown in progress bar
+        if rel in file_progress:
+            queue.append({"filename": rel, "status": "paused", "resume_page": file_progress[rel]})
+        else:
+            queue.append({"filename": rel, "status": "queued"})
+    return queue
+
+
+def _send_pipeline_command(command: str):
     try:
         requests.post(
             f"{PIPELINES_URL}/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {PIPELINES_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": PIPELINE_MODEL,
-                "messages": [{"role": "user", "content": "__cancel_index__"}],
-            },
+            headers={"Authorization": f"Bearer {PIPELINES_API_KEY}", "Content-Type": "application/json"},
+            json={"model": PIPELINE_MODEL, "messages": [{"role": "user", "content": command}]},
             timeout=5,
         )
     except Exception:
         pass
+
+
+@app.post("/cancel")
+def cancel_indexing():
+    """Hard cancel — stops indexing, clears progress, removes partial Qdrant vectors."""
+    _send_pipeline_command("__cancel_index__")
     return {"status": "cancel_requested"}
+
+
+@app.post("/pause")
+def pause_indexing():
+    """Pause — stops indexing and saves progress so it resumes on next run."""
+    _send_pipeline_command("__pause_index__")
+    return {"status": "pause_requested"}
 
 
 @app.delete("/delete/{filename}")
@@ -169,10 +221,14 @@ def delete_pdf(filename: str):
     if STATE_FILE.exists():
         with open(STATE_FILE) as f:
             state = json.load(f)
-        indexed = state.get("indexed_files", [])
-        if filename in indexed:
-            indexed.remove(filename)
-            state["indexed_files"] = indexed
+        changed = False
+        if filename in state.get("indexed_files", []):
+            state["indexed_files"].remove(filename)
+            changed = True
+        if filename in state.get("skipped_files", []):
+            state["skipped_files"].remove(filename)
+            changed = True
+        if changed:
             tmp = str(STATE_FILE) + ".tmp"
             with open(tmp, "w") as f:
                 json.dump(state, f)
@@ -194,6 +250,26 @@ def delete_pdf(filename: str):
     except Exception as e:
         qdrant_ok = False
         log.error(f"Qdrant delete FAILED for {filename}: {e}")
+
+    # Remove from watcher_state.json so the Confluence watcher won't re-sync this file
+    if WATCHER_STATE_FILE.exists():
+        try:
+            with open(WATCHER_STATE_FILE) as f:
+                wstate = json.load(f)
+            changed = False
+            for space_key in list(wstate.keys()):
+                for page_id in list(wstate[space_key].keys()):
+                    if wstate[space_key][page_id].get("pdf_filename") == filename:
+                        del wstate[space_key][page_id]
+                        changed = True
+                        log.info(f"Removed {filename} from watcher_state ({space_key}/{page_id})")
+            if changed:
+                tmp = str(WATCHER_STATE_FILE) + ".tmp"
+                with open(tmp, "w") as f:
+                    json.dump(wstate, f, indent=2)
+                os.replace(tmp, str(WATCHER_STATE_FILE))
+        except Exception as e:
+            log.warning(f"Failed to clean watcher_state for {filename}: {e}")
 
     return {"status": "deleted", "filename": filename, "qdrant_cleaned": qdrant_ok}
 
@@ -434,7 +510,7 @@ def ui():
     .progress-pages {
       font-size: 12px; color: var(--text-muted);
     }
-    #cancelBtn {
+    .ctrl-btn {
       background: transparent;
       border: 1px solid var(--border);
       color: var(--text-muted);
@@ -444,12 +520,17 @@ def ui():
       cursor: pointer;
       transition: background .15s, color .15s, border-color .15s;
     }
+    #pauseBtn:hover {
+      background: var(--amber-bg);
+      color: var(--amber);
+      border-color: rgba(210,153,34,.3);
+    }
     #cancelBtn:hover {
       background: var(--red-bg);
       color: var(--red);
       border-color: rgba(248,81,73,.3);
     }
-    #cancelBtn:disabled { opacity: .4; cursor: default; }
+    .ctrl-btn:disabled { opacity: .4; cursor: default; }
 
     .idle-badge {
       display: inline-flex; align-items: center; gap: 6px;
@@ -512,6 +593,24 @@ def ui():
       color: var(--text-muted); font-size: 14px;
     }
     .empty-state .empty-icon { font-size: 32px; margin-bottom: 8px; }
+
+    /* ── Queue list ── */
+    #queueList li {
+      display: flex; align-items: center; gap: 8px;
+      font-size: 13px; color: var(--text-muted);
+      padding: 3px 0;
+    }
+    #queueList .q-icon { flex-shrink: 0; font-size: 13px; }
+    #queueList .q-name {
+      flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      color: var(--text);
+    }
+    #queueList .q-badge {
+      font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: .05em;
+      padding: 1px 7px; border-radius: 20px; flex-shrink: 0;
+    }
+    .q-badge.queued  { background: var(--surface2); color: var(--text-muted); border: 1px solid var(--border); }
+    .q-badge.paused  { background: var(--accent-bg); color: var(--accent-hi); border: 1px solid rgba(124,58,237,.25); }
   </style>
 </head>
 <body>
@@ -561,10 +660,15 @@ def ui():
         </div>
         <div class="progress-footer">
           <div class="progress-pages" id="progPages"></div>
-          <button id="cancelBtn" onclick="cancelIndexing()">✕ Cancel</button>
+          <button id="pauseBtn"  class="ctrl-btn" onclick="pauseIndexing()">⏸ Pause</button>
+          <button id="cancelBtn" class="ctrl-btn" onclick="cancelIndexing()">✕ Cancel</button>
         </div>
       </div>
       <div id="idleWrap"><div class="idle-badge">● Idle — all documents indexed</div></div>
+      <div id="queueWrap" style="display:none; margin-top:14px; border-top:1px solid var(--border); padding-top:12px;">
+        <div style="font-size:12px; font-weight:600; text-transform:uppercase; letter-spacing:.06em; color:var(--text-muted); margin-bottom:8px;">Up next</div>
+        <ul id="queueList" style="list-style:none; display:flex; flex-direction:column; gap:5px;"></ul>
+      </div>
     </div>
 
     <!-- File library card -->
@@ -642,7 +746,7 @@ def ui():
       document.getElementById('uploadBtnLabel').textContent = 'Retry Upload';
       document.getElementById('uploadBtnIcon').textContent = '⬆';
     }
-    refreshStatus();
+    refresh();
   }
 
   // ── Delete ─────────────────────────────────────────────────────────
@@ -658,7 +762,7 @@ def ui():
     } else {
       toast('Delete failed — refreshing', 'err');
     }
-    refreshStatus();
+    refresh();
   }
 
   // ── Show empty state if file list is now empty ────────────────────
@@ -668,13 +772,22 @@ def ui():
     empty.style.display = ul.children.length === 0 ? '' : 'none';
   }
 
-  // ── Cancel indexing ────────────────────────────────────────────────
+  // ── Pause indexing (saves progress, resumes next run) ──────────────
+  async function pauseIndexing() {
+    const btn = document.getElementById('pauseBtn');
+    btn.disabled = true;
+    btn.textContent = 'Pausing…';
+    await fetch('/pause', { method: 'POST' });
+    toast('Paused — will resume from this point next run', 'ok');
+  }
+
+  // ── Cancel indexing (clears progress, no resume) ───────────────────
   async function cancelIndexing() {
     const btn = document.getElementById('cancelBtn');
     btn.disabled = true;
     btn.textContent = 'Cancelling…';
     await fetch('/cancel', { method: 'POST' });
-    toast('Cancellation requested — will stop after current page', 'ok');
+    toast('Cancelled — progress cleared, partial vectors removed', 'ok');
   }
 
   // ── Immediate queued feedback (before first poll returns active state) ──
@@ -688,6 +801,30 @@ def ui():
     document.getElementById('progPct').textContent = '0%';
     document.getElementById('progBar').style.width = '0%';
     document.getElementById('progPages').textContent = 'Starting…';
+  }
+
+  // ── Queue ──────────────────────────────────────────────────────────
+  async function refreshQueue() {
+    try {
+      const r = await fetch('/queue');
+      const queue = await r.json();
+      const wrap = document.getElementById('queueWrap');
+      const ul   = document.getElementById('queueList');
+      if (!queue.length) { wrap.style.display = 'none'; return; }
+      wrap.style.display = '';
+      ul.innerHTML = '';
+      queue.forEach(f => {
+        const li = document.createElement('li');
+        const sub = f.status === 'paused' ? ` · resumed from p.${f.resume_page}` : '';
+        const badgeClass = f.status === 'paused' ? 'paused' : 'queued';
+        li.innerHTML = `
+          <span class="q-icon">📄</span>
+          <span class="q-name" title="${f.filename}">${f.filename}${sub}</span>
+          <span class="q-badge ${badgeClass}">${f.status}</span>
+        `;
+        ul.appendChild(li);
+      });
+    } catch (_) {}
   }
 
   // ── Status poll ────────────────────────────────────────────────────
@@ -721,6 +858,8 @@ def ui():
         document.getElementById('progBar').style.width = pct + '%';
         document.getElementById('progPages').textContent =
           job.current_page === 0 ? 'Starting…' : `Page ${job.current_page} of ${job.total_pages}`;
+        const pb = document.getElementById('pauseBtn');
+        pb.disabled = false; pb.textContent = '⏸ Pause';
         const cb = document.getElementById('cancelBtn');
         cb.disabled = false; cb.textContent = '✕ Cancel';
       } else {
@@ -765,8 +904,9 @@ def ui():
     toastTimer = setTimeout(() => { el.className = ''; }, 3500);
   }
 
-  refreshStatus();
-  setInterval(refreshStatus, 3000);
+  function refresh() { refreshStatus(); refreshQueue(); }
+  refresh();
+  setInterval(refresh, 3000);
 </script>
 </body>
 </html>

@@ -61,6 +61,7 @@ services:
     environment:
       - PDF_DIR=/app/downloads
       - STATE_FILE=/app/pipelines/pipeline_state.json
+      - WATCHER_STATE_FILE=/app/watcher_state/watcher_state.json
       - PIPELINES_URL=http://pipelines:9099
       - PIPELINES_API_KEY=0p3n-w3bu!
       - PIPELINE_MODEL=colpali-pipeline
@@ -70,6 +71,7 @@ services:
     volumes:
       - ./my-pdfs:/app/downloads
       - ./pipelines:/app/pipelines
+      - ./confluence-watcher:/app/watcher_state
     depends_on:
       - pipelines
       - qdrant
