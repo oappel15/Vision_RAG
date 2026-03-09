@@ -59,6 +59,7 @@ class Pipeline:
         self._cancel_flag = threading.Event()
         self._cancel_hard = threading.Event()   # hard cancel: clears progress + Qdrant vectors
         self._current_indexing_file: str = None
+        self._pending_trigger = False           # queued __index_now__ while thread was busy
 
     async def on_startup(self):
         log.info("on_startup: loading model eagerly in executor …")
@@ -163,8 +164,10 @@ class Pipeline:
     def _start_background_index(self):
         """Spawn a daemon thread to run indexing, unless one is already running."""
         if self._index_thread and self._index_thread.is_alive():
-            log.info("Indexing already in progress — skipping duplicate trigger")
+            self._pending_trigger = True  # re-run after current pass finishes
+            log.info("Indexing already in progress — trigger queued for after current run")
             return
+        self._pending_trigger = False
         self._index_thread = threading.Thread(
             target=self._background_index_worker,
             daemon=True,
@@ -182,6 +185,15 @@ class Pipeline:
                 self._index_local_pdfs()
             except Exception as e:
                 log.error(f"Background indexing failed: {e}", exc_info=True)
+        # If a __index_now__ arrived while we were running, do another pass now.
+        # Must spawn directly — calling _start_background_index() from inside the
+        # worker thread would see self._index_thread.is_alive()==True and deadlock.
+        if self._pending_trigger and not self._cancel_flag.is_set():
+            self._pending_trigger = False
+            log.info("Running queued trigger pass")
+            t = threading.Thread(target=self._background_index_worker, daemon=True, name="pdf-indexer")
+            self._index_thread = t
+            t.start()
 
     def _format_index_status(self) -> str:
         """Return a human-readable markdown string describing current index state."""
@@ -284,6 +296,7 @@ class Pipeline:
             state["schema_version"] = SCHEMA_VERSION
             state.get("file_progress", {}).pop(rel, None)
             self._save_state(state)
+            self._current_indexing_file = None  # clear so cancel-between-files doesn't blame this file
 
         # Clear index_job on completion or cancellation
         state = self._load_state()

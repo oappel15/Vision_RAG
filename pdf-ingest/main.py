@@ -228,6 +228,9 @@ def delete_pdf(filename: str):
         if filename in state.get("skipped_files", []):
             state["skipped_files"].remove(filename)
             changed = True
+        if filename in state.get("file_progress", {}):
+            del state["file_progress"][filename]
+            changed = True
         if changed:
             tmp = str(STATE_FILE) + ".tmp"
             with open(tmp, "w") as f:

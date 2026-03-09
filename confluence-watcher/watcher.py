@@ -272,13 +272,22 @@ def patch_pipeline_state(filename: str) -> None:
     try:
         with open(PIPELINE_STATE_FILE) as f:
             state = json.load(f)
+        changed = False
         if filename in state.get("indexed_files", []):
             state["indexed_files"] = [f for f in state["indexed_files"] if f != filename]
+            changed = True
+        if filename in state.get("skipped_files", []):
+            state["skipped_files"] = [f for f in state["skipped_files"] if f != filename]
+            changed = True
+        if filename in state.get("file_progress", {}):
+            del state["file_progress"][filename]
+            changed = True
+        if changed:
             tmp = str(PIPELINE_STATE_FILE) + ".tmp"
             with open(tmp, "w") as f:
                 json.dump(state, f)
             os.replace(tmp, str(PIPELINE_STATE_FILE))
-            log.info(f"Removed {filename} from pipeline_state indexed_files")
+            log.info(f"Cleared {filename} from pipeline_state")
     except Exception as e:
         log.warning(f"Failed to patch pipeline_state.json: {e}")
 
