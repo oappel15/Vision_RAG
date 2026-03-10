@@ -8,7 +8,7 @@ description: Visual RAG pipeline using ColQwen2 multi-vector MaxSim + Qdrant + O
 """
 
 import asyncio
-import os, json, base64, io, logging, pathlib, hashlib, re, threading
+import os, json, base64, io, logging, pathlib, hashlib, re, threading, time
 from typing import List, Literal, Optional
 
 import torch
@@ -62,6 +62,7 @@ class Pipeline:
         self._cancel_hard = threading.Event()   # hard cancel: clears progress + Qdrant vectors
         self._current_indexing_file: str = None
         self._pending_trigger = False           # queued __index_now__ while thread was busy
+        self._query_active = threading.Event()  # set while a query is running; indexing pauses between pages
 
     async def on_startup(self):
         log.info("on_startup: loading model eagerly in executor …")
@@ -387,10 +388,16 @@ class Pipeline:
 
             img_filename = self._save_page_image(page_img, filename, page_num)
 
+            # Pause between pages if a query is actively using the model
+            if self._query_active.is_set():
+                log.info(f"    Pausing indexing — query in progress")
+                while self._query_active.is_set():
+                    time.sleep(0.2)
+                log.info(f"    Resuming indexing")
+
             batch = self.processor.process_images([page_img])
             with torch.no_grad():
                 emb = self.model(**batch)
-
             multi_vec = emb[0].tolist()
             del page_img, batch, emb  # free memory immediately
 
@@ -422,12 +429,16 @@ class Pipeline:
     # ── search with MULTI-VECTOR MaxSim ──────────────────────────────
 
     def _search(self, query: str, top_k: int = 5):
-        batch = self.processor.process_queries([query])
-        with torch.no_grad():
-            emb = self.model(**batch)
+        self._query_active.set()
+        try:
+            batch = self.processor.process_queries([query])
+            with torch.no_grad():
+                emb = self.model(**batch)
+            q_vecs = emb[0].tolist()   # shape: (num_query_tokens, dim)
+        finally:
+            self._query_active.clear()
 
         # ── Full multi-vector query (all query tokens) ──────────────
-        q_vecs = emb[0].tolist()   # shape: (num_query_tokens, dim)
         log.info(f"Query encoded → {len(q_vecs)} tokens")
 
         return self.qdrant.query_points(
