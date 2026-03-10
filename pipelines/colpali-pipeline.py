@@ -19,6 +19,7 @@ from qdrant_client import QdrantClient
 from qdrant_client.models import (
     Distance, VectorParams, PointStruct, SearchParams,
     MultiVectorConfig, MultiVectorComparator,
+    Filter, FieldCondition, MatchValue, FilterSelector,
 )
 from colpali_engine.models import ColQwen2, ColQwen2Processor
 
@@ -36,6 +37,7 @@ class Pipeline:
         PDF_DIR: str = "/app/downloads"
         COLLECTION_NAME: str = "target_knowledge"
         TOP_K: int = 8
+        MAX_PAGES_PER_DOC: int = 2  # max pages per document in TOP_K results (0 = no limit)
         SCORE_THRESHOLD: float = 0.0
         # ── VLM backend ── set VLM_PROVIDER to "ollama" to use local Ollama instead
         VLM_PROVIDER: Literal["openrouter", "ollama"] = "openrouter"
@@ -242,12 +244,9 @@ class Pipeline:
             self._save_state(state)
 
         indexed = set(state.get("indexed_files", []))
-        skipped = set(state.get("skipped_files", []))
         file_progress = state.get("file_progress", {})
 
-        # Include both unstarted and partially-indexed files; exclude hard-cancelled files
-        to_index = [p for p in pdfs if str(p.relative_to(pdf_dir)) not in indexed
-                    and str(p.relative_to(pdf_dir)) not in skipped]
+        to_index = [p for p in pdfs if str(p.relative_to(pdf_dir)) not in indexed]
 
         if not to_index:
             log.info("All PDFs already indexed – skipping")
@@ -276,6 +275,31 @@ class Pipeline:
 
         global_page_id = self.qdrant.get_collection(collection).points_count
 
+        # ── Reconcile indexed_files against Qdrant ──────────────────
+        # Done here (after collection is confirmed reachable) so Qdrant scroll is safe.
+        # Removes any file that claims to be indexed but has no vectors (e.g. after OOM restart).
+        if indexed:
+            ghost_files = []
+            for filename in list(indexed):
+                pts, _ = self.qdrant.scroll(
+                    collection_name=collection,
+                    scroll_filter=Filter(must=[FieldCondition(key="source", match=MatchValue(value=filename))]),
+                    limit=1,
+                    with_payload=False,
+                    with_vectors=False,
+                )
+                if not pts:
+                    ghost_files.append(filename)
+            if ghost_files:
+                log.info(f"Reconciliation: removing {len(ghost_files)} phantom entries → {ghost_files}")
+                state = self._load_state()
+                state["indexed_files"] = [f for f in state["indexed_files"] if f not in ghost_files]
+                self._save_state(state)
+                indexed -= set(ghost_files)
+                # Rebuild to_index to include the newly discovered ghosts
+                to_index = [p for p in pdfs if str(p.relative_to(pdf_dir)) not in indexed]
+                log.info(f"After reconciliation: {len(to_index)} PDFs to index")
+
         for pdf_file in to_index:
             if self._cancel_flag.is_set():
                 log.info("Indexing cancelled — stopping before next file")
@@ -302,7 +326,7 @@ class Pipeline:
         state = self._load_state()
         if self._cancel_flag.is_set():
             if self._cancel_hard.is_set():
-                # Hard cancel: wipe progress + partial Qdrant vectors + mark as skipped
+                # Hard cancel: delete PDF from disk + Qdrant vectors + clear state
                 current_file = self._current_indexing_file
                 if current_file:
                     state.get("file_progress", {}).pop(current_file, None)
@@ -313,14 +337,17 @@ class Pipeline:
                                 filter=Filter(must=[FieldCondition(key="source", match=MatchValue(value=current_file))])
                             ),
                         )
-                        log.info(f"Hard cancel: deleted partial Qdrant vectors for {current_file}")
+                        log.info(f"Hard cancel: deleted Qdrant vectors for {current_file}")
                     except Exception as e:
                         log.warning(f"Hard cancel: Qdrant cleanup failed for {current_file}: {e}")
-                    # Add to skip list so __index_now__ won't restart this file automatically
-                    skipped_list = state.setdefault("skipped_files", [])
-                    if current_file not in skipped_list:
-                        skipped_list.append(current_file)
-                    log.info(f"Hard cancel complete — {current_file} added to skip list")
+                    try:
+                        pdf_path = pathlib.Path(self.valves.PDF_DIR) / current_file
+                        if pdf_path.exists():
+                            pdf_path.unlink()
+                            log.info(f"Hard cancel: deleted file {pdf_path}")
+                    except Exception as e:
+                        log.warning(f"Hard cancel: file deletion failed for {current_file}: {e}")
+                    log.info(f"Hard cancel complete — {current_file} deleted")
             else:
                 log.info("Pause — partial progress checkpointed, will resume on next run")
         else:
@@ -508,63 +535,72 @@ class Pipeline:
                     {
                         "role": "system",
                         "content": (
-                            "You are a document assistant. "
-                            "You are given page images from the user's document collection, "
-                            "each labeled [REF:N]. "
-                            "RULES — follow these exactly:\n"
+                            "You are an expert document analyst and technical writer. "
+                            "You are given page images from the user's document collection, each labeled [REF:N].\n\n"
+                            "RESPONSE STYLE:\n"
+                            "- Write thorough, well-structured answers. Never give a one-liner when a complete explanation is warranted.\n"
+                            "- Use markdown formatting to make answers visually clear: headers (##/###) to organize sections, "
+                            "bullet points or numbered lists for sequences and enumerations, "
+                            "**bold** for key terms, `code` for values/commands/identifiers, "
+                            "and tables where comparing multiple items.\n"
+                            "- Open with a short direct answer, then elaborate with details, context, and examples from the pages.\n"
+                            "- Close with a brief summary or takeaway when the answer is long.\n\n"
+                            "CITATION RULES — follow exactly:\n"
                             "1. Answer using ONLY information visible in the provided pages.\n"
-                            "2. Every factual claim MUST be followed immediately by its inline "
-                            "citation in the form [REF:N] — no exceptions "
-                            "(example: 'The range is 340 miles [REF:2].').\n"
-                            "3. Only cite a page if it DIRECTLY provides key information used in your answer. "
-                            "Do NOT cite pages that are only tangentially related, background context, or marginally mentioned.\n"
-                            "4. If information spans multiple pages, chain citations as needed "
+                            "2. Every factual claim MUST be followed immediately by its inline citation [REF:N] — no exceptions "
+                            "(example: 'The voltage range is 3.3 V to 5 V [REF:2].').\n"
+                            "3. Only cite a page if it DIRECTLY provides the information used. "
+                            "Do NOT cite pages that are only tangentially related or marginally mentioned.\n"
+                            "4. Chain citations when information spans multiple pages "
                             "(example: 'Connect A to B [REF:1], then B to C [REF:3].').\n"
                             "5. If none of the pages contain relevant information, say so plainly."
                         ),
                     },
                     {"role": "user", "content": content_parts},
                 ],
-                "max_tokens": 2048,
+                "max_tokens": 4096,
                 "stream": True,
             },
             stream=True,
-            timeout=120,
+            timeout=180,
         ) as resp:
             resp.raise_for_status()
             carry = ""
-            for line in resp.iter_lines():
-                if not line or not line.startswith(b"data: "):
-                    continue
-                data = line[6:]
-                if data == b"[DONE]":
-                    break
-                parsed = json.loads(data)
-                choices = parsed.get("choices", [])
-                if not choices:
-                    continue
-                delta = choices[0]["delta"].get("content", "")
-                if not delta:
-                    continue
-
-                text = carry + delta
-                carry = ""
-
-                # Hold back from the first unclosed [ (multi-ref safe)
-                open_pos = text.find('[')
-                while open_pos != -1:
-                    close_pos = text.find(']', open_pos)
-                    if close_pos == -1:
-                        carry = text[open_pos:]
-                        text = text[:open_pos]
+            try:
+                for line in resp.iter_lines():
+                    if not line or not line.startswith(b"data: "):
+                        continue
+                    data = line[6:]
+                    if data == b"[DONE]":
                         break
-                    open_pos = text.find('[', close_pos + 1)
+                    parsed = json.loads(data)
+                    choices = parsed.get("choices", [])
+                    if not choices:
+                        continue
+                    delta = choices[0]["delta"].get("content", "")
+                    if not delta:
+                        continue
 
-                text = self._expand_refs(text, hits, cited)
-                if text:
-                    yield text
+                    text = carry + delta
+                    carry = ""
 
-            # Flush carry buffer
+                    # Hold back from the first unclosed [ (multi-ref safe)
+                    open_pos = text.find('[')
+                    while open_pos != -1:
+                        close_pos = text.find(']', open_pos)
+                        if close_pos == -1:
+                            carry = text[open_pos:]
+                            text = text[:open_pos]
+                            break
+                        open_pos = text.find('[', close_pos + 1)
+
+                    text = self._expand_refs(text, hits, cited)
+                    if text:
+                        yield text
+            except Exception as stream_err:
+                log.warning(f"Stream cut short: {stream_err}")
+
+            # Flush carry buffer (also handles graceful stream cut)
             if carry:
                 carry = self._expand_refs(carry, hits, cited)
                 if carry:

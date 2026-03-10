@@ -113,20 +113,6 @@ async def upload_pdf(file: UploadFile = File(...)):
     with open(dest, "wb") as f:
         f.write(content)
 
-    # Clear skip flag so a re-uploaded previously-cancelled file gets indexed
-    if STATE_FILE.exists():
-        try:
-            with open(STATE_FILE) as f:
-                state = json.load(f)
-            if file.filename in state.get("skipped_files", []):
-                state["skipped_files"].remove(file.filename)
-                tmp = str(STATE_FILE) + ".tmp"
-                with open(tmp, "w") as f:
-                    json.dump(state, f)
-                os.replace(tmp, str(STATE_FILE))
-        except Exception:
-            pass
-
     # Fire-and-forget: trigger background indexing via existing pipeline API
     try:
         requests.post(
@@ -224,9 +210,6 @@ def delete_pdf(filename: str):
         changed = False
         if filename in state.get("indexed_files", []):
             state["indexed_files"].remove(filename)
-            changed = True
-        if filename in state.get("skipped_files", []):
-            state["skipped_files"].remove(filename)
             changed = True
         if filename in state.get("file_progress", {}):
             del state["file_progress"][filename]
