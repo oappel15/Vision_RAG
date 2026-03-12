@@ -1,14 +1,14 @@
 """
 title: ColQwen2 Visual RAG (CPU) – Multi-Vector MaxSim
 author: adapted
-version: 10.0
+version: 10.1
 license: MIT
 description: Visual RAG pipeline using ColQwen2 multi-vector MaxSim + Qdrant + OpenRouter VLM.
              Background indexing thread — queries are never blocked by indexing.
 """
 
 import asyncio
-import os, json, base64, io, logging, pathlib, hashlib, re, threading, time
+import os, json, base64, io, logging, pathlib, hashlib, re, threading, time, gc, uuid
 from typing import List, Literal, Optional
 
 import torch
@@ -27,7 +27,7 @@ log = logging.getLogger("colpali-pipeline")
 log.setLevel(logging.DEBUG)
 
 STATE_FILE = "/app/pipelines/pipeline_state.json"
-SCHEMA_VERSION = 2  # v1 = mean-pooled (broken), v2 = multi-vector MaxSim
+SCHEMA_VERSION = 3  # v1 = mean-pooled (broken), v2 = multi-vector MaxSim, v3 = UUID point IDs
 
 
 class Pipeline:
@@ -63,6 +63,7 @@ class Pipeline:
         self._current_indexing_file: str = None
         self._pending_trigger = False           # queued __index_now__ while thread was busy
         self._query_active = threading.Event()  # set while a query is running; indexing pauses between pages
+        self._skipped_file: str = None          # file that was paused/cancelled — defer to end of queue
 
     async def on_startup(self):
         log.info("on_startup: loading model eagerly in executor …")
@@ -188,12 +189,15 @@ class Pipeline:
                 self._index_local_pdfs()
             except Exception as e:
                 log.error(f"Background indexing failed: {e}", exc_info=True)
-        # If a __index_now__ arrived while we were running, do another pass now.
+        # Decide whether to spawn another pass.
         # Must spawn directly — calling _start_background_index() from inside the
         # worker thread would see self._index_thread.is_alive()==True and deadlock.
-        if self._pending_trigger and not self._cancel_flag.is_set():
+        # Always restart to process remaining queue, unless normal idle completion.
+        # Must spawn directly — calling _start_background_index() from inside the
+        # worker thread would see self._index_thread.is_alive()==True and deadlock.
+        if self._cancel_flag.is_set() or self._pending_trigger:
             self._pending_trigger = False
-            log.info("Running queued trigger pass")
+            log.info("Restarting indexer to continue remaining queue")
             t = threading.Thread(target=self._background_index_worker, daemon=True, name="pdf-indexer")
             self._index_thread = t
             t.start()
@@ -247,7 +251,18 @@ class Pipeline:
         indexed = set(state.get("indexed_files", []))
         file_progress = state.get("file_progress", {})
 
-        to_index = [p for p in pdfs if str(p.relative_to(pdf_dir)) not in indexed]
+        # Fresh files first, then partially-indexed, skipped file (last paused/cancelled) last.
+        skipped = self._skipped_file
+        self._skipped_file = None  # consume it
+        def _sort_key(p):
+            rel = str(p.relative_to(pdf_dir))
+            if rel == skipped:    return (2, rel)  # deferred — goes last
+            if rel in file_progress: return (1, rel)  # partial progress
+            return (0, rel)                           # fresh — goes first
+        to_index = sorted(
+            [p for p in pdfs if str(p.relative_to(pdf_dir)) not in indexed],
+            key=_sort_key
+        )
 
         if not to_index:
             log.info("All PDFs already indexed – skipping")
@@ -274,8 +289,6 @@ class Pipeline:
             )
             log.info(f"Created collection '{collection}' dim={dim} with MaxSim")
 
-        global_page_id = self.qdrant.get_collection(collection).points_count
-
         # ── Reconcile indexed_files against Qdrant ──────────────────
         # Done here (after collection is confirmed reachable) so Qdrant scroll is safe.
         # Removes any file that claims to be indexed but has no vectors (e.g. after OOM restart).
@@ -298,7 +311,10 @@ class Pipeline:
                 self._save_state(state)
                 indexed -= set(ghost_files)
                 # Rebuild to_index to include the newly discovered ghosts
-                to_index = [p for p in pdfs if str(p.relative_to(pdf_dir)) not in indexed]
+                to_index = sorted(
+                    [p for p in pdfs if str(p.relative_to(pdf_dir)) not in indexed],
+                    key=_sort_key
+                )
                 log.info(f"After reconciliation: {len(to_index)} PDFs to index")
 
         for pdf_file in to_index:
@@ -310,13 +326,16 @@ class Pipeline:
             # Resume from the last completed page, or start from 1
             start_page = file_progress.get(rel, 0) + 1
             log.info(f"  Indexing {rel} (from page {start_page}) …")
-            global_page_id = self._ingest(rel, collection, global_page_id, start_page)
+            self._ingest(rel, collection, start_page)
             if self._cancel_flag.is_set():
                 log.info(f"Indexing cancelled after {rel}")
+                self._skipped_file = rel  # defer this file to end of queue on next pass
                 break
-            # Reload state before writing so sidecar deletions made during indexing are preserved
+            # Reload state before writing so sidecar deletions made during indexing are preserved.
+            # Only add to indexed_files if the PDF still exists — the sidecar may have deleted it
+            # while we were indexing other files, and we must not re-add a deleted file.
             state = self._load_state()
-            if rel not in state.get("indexed_files", []):
+            if (pathlib.Path(self.valves.PDF_DIR) / rel).exists() and rel not in state.get("indexed_files", []):
                 state.setdefault("indexed_files", []).append(rel)
             state["schema_version"] = SCHEMA_VERSION
             state.get("file_progress", {}).pop(rel, None)
@@ -356,18 +375,16 @@ class Pipeline:
         state["index_job"] = {}
         self._save_state(state)
 
-    def _ingest(self, filename: str, collection: str, start_id: int, start_page: int = 1) -> int:
+    def _ingest(self, filename: str, collection: str, start_page: int = 1) -> None:
         from pdf2image import pdfinfo_from_path
 
         pdf_path = pathlib.Path(self.valves.PDF_DIR) / filename
         total_pages = pdfinfo_from_path(str(pdf_path))["Pages"]
         log.info(f"    {filename}: {total_pages} total pages")
 
-        state = self._load_state()
-        if "file_progress" not in state:
-            state["file_progress"] = {}
-
         # Write index_job immediately so UI shows progress before first page completes
+        state = self._load_state()
+        state.setdefault("file_progress", {})
         state["index_job"] = {
             "active": True,
             "current_file": filename,
@@ -376,7 +393,6 @@ class Pipeline:
         }
         self._save_state(state)
 
-        pid = start_id
         for page_num in range(start_page, total_pages + 1):
             if self._cancel_flag.is_set():
                 log.info(f"    Cancelled at page {page_num}/{total_pages} — progress saved")
@@ -393,6 +409,7 @@ class Pipeline:
                 log.info(f"    Pausing indexing — query in progress")
                 while self._query_active.is_set():
                     time.sleep(0.2)
+                time.sleep(0.5)  # let OS reclaim query tensors before next page
                 log.info(f"    Resuming indexing")
 
             batch = self.processor.process_images([page_img])
@@ -400,9 +417,16 @@ class Pipeline:
                 emb = self.model(**batch)
             multi_vec = emb[0].tolist()
             del page_img, batch, emb  # free memory immediately
+            gc.collect()
 
+            # Check again after the slow embed step — skip upsert if cancelled
+            if self._cancel_flag.is_set():
+                log.info(f"    Cancelled after embed page {page_num}/{total_pages} — skipping upsert")
+                break
+
+            point_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"{filename}:{page_num}"))
             self.qdrant.upsert(collection, [PointStruct(
-                id=pid,
+                id=point_id,
                 vector=multi_vec,
                 payload={
                     "source": filename,
@@ -411,11 +435,12 @@ class Pipeline:
                 },
             )])
 
-            log.info(f"    page {page_num}/{total_pages}  id={pid}  patches={len(multi_vec)}")
-            pid += 1
+            log.info(f"    page {page_num}/{total_pages}  id={point_id}  patches={len(multi_vec)}")
 
-            # Checkpoint after every page: persist progress + live index_job status
-            state["file_progress"][filename] = page_num
+            # Checkpoint: reload fresh state so any sidecar deletions made during this
+            # long-running ingest are not overwritten by a stale state object.
+            state = self._load_state()
+            state.setdefault("file_progress", {})[filename] = page_num
             state["index_job"] = {
                 "active": True,
                 "current_file": filename,
@@ -423,8 +448,6 @@ class Pipeline:
                 "total_pages": total_pages,
             }
             self._save_state(state)
-
-        return pid
 
     # ── search with MULTI-VECTOR MaxSim ──────────────────────────────
 
@@ -435,8 +458,10 @@ class Pipeline:
             with torch.no_grad():
                 emb = self.model(**batch)
             q_vecs = emb[0].tolist()   # shape: (num_query_tokens, dim)
+            del batch, emb
         finally:
             self._query_active.clear()
+            gc.collect()  # reclaim query tensors before indexing resumes
 
         # ── Full multi-vector query (all query tokens) ──────────────
         log.info(f"Query encoded → {len(q_vecs)} tokens")
@@ -468,8 +493,9 @@ class Pipeline:
                     parts.append(f"**[\\[Page {pg}\\]]({url})**" if url else f"Page {pg}")
             return " ".join(parts) if parts else m.group(0)
 
+        # Matches [REF:2], [REF:2, REF:6], and shorthand [REF:2, 6] or [REF:2, 6, 8]
         return re.sub(
-            r'\[REF\s*:\s*\d+(?:\s*[,;]\s*REF\s*:\s*\d+)*\s*\]',
+            r'\[REF\s*:\s*\d+(?:\s*[,;]\s*(?:REF\s*:\s*)?\d+)*\s*\]',
             _sub, text, flags=re.IGNORECASE,
         )
 
@@ -552,8 +578,8 @@ class Pipeline:
                             "- Write thorough, well-structured answers. Never give a one-liner when a complete explanation is warranted.\n"
                             "- Use markdown formatting to make answers visually clear: headers (##/###) to organize sections, "
                             "bullet points or numbered lists for sequences and enumerations, "
-                            "**bold** for key terms, `code` for values/commands/identifiers, "
-                            "and tables where comparing multiple items.\n"
+                            "**bold** for key terms and figure/table references, `code` for values/commands/identifiers, "
+                            "and tables where comparing multiple items. Do NOT use italic (*text*).\n"
                             "- Open with a short direct answer, then elaborate with details, context, and examples from the pages.\n"
                             "- Close with a brief summary or takeaway when the answer is long.\n\n"
                             "CITATION RULES — follow exactly:\n"

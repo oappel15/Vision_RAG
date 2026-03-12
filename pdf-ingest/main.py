@@ -263,7 +263,7 @@ def delete_pdf(filename: str):
 @app.get("/", response_class=HTMLResponse)
 @app.get("/ui", response_class=HTMLResponse)
 def ui():
-    return r"""<!DOCTYPE html>
+    return HTMLResponse(content=r"""<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
@@ -758,22 +758,31 @@ def ui():
     empty.style.display = ul.children.length === 0 ? '' : 'none';
   }
 
+  // Tracks a pending pause/cancel while waiting for the current page embed to finish
+  let pendingAction = null; // { type: 'pausing'|'cancelling', file: string }
+
   // ── Pause indexing (saves progress, resumes next run) ──────────────
   async function pauseIndexing() {
-    const btn = document.getElementById('pauseBtn');
-    btn.disabled = true;
-    btn.textContent = 'Pausing…';
+    const pb = document.getElementById('pauseBtn');
+    const cb = document.getElementById('cancelBtn');
+    const currentFile = document.getElementById('progFile').textContent;
+    pendingAction = { type: 'pausing', file: currentFile };
+    pb.disabled = true; pb.textContent = '⏸ Finishing page…';
+    cb.disabled = true;
+    document.getElementById('progPages').textContent = '⏸ Pausing — finishing current page…';
     await fetch('/pause', { method: 'POST' });
-    toast('Paused — will resume from this point next run', 'ok');
   }
 
   // ── Cancel indexing (clears progress, no resume) ───────────────────
   async function cancelIndexing() {
-    const btn = document.getElementById('cancelBtn');
-    btn.disabled = true;
-    btn.textContent = 'Cancelling…';
+    const pb = document.getElementById('pauseBtn');
+    const cb = document.getElementById('cancelBtn');
+    const currentFile = document.getElementById('progFile').textContent;
+    pendingAction = { type: 'cancelling', file: currentFile };
+    cb.disabled = true; cb.textContent = '✕ Finishing page…';
+    pb.disabled = true;
+    document.getElementById('progPages').textContent = '✕ Cancelling — finishing current page…';
     await fetch('/cancel', { method: 'POST' });
-    toast('Cancelled — progress cleared, partial vectors removed', 'ok');
   }
 
   // ── Immediate queued feedback (before first poll returns active state) ──
@@ -842,13 +851,35 @@ def ui():
         document.getElementById('progFile').textContent = job.current_file;
         document.getElementById('progPct').textContent = pct + '%';
         document.getElementById('progBar').style.width = pct + '%';
-        document.getElementById('progPages').textContent =
-          job.current_page === 0 ? 'Starting…' : `Page ${job.current_page} of ${job.total_pages}`;
         const pb = document.getElementById('pauseBtn');
-        pb.disabled = false; pb.textContent = '⏸ Pause';
         const cb = document.getElementById('cancelBtn');
-        cb.disabled = false; cb.textContent = '✕ Cancel';
+        if (pendingAction && job.current_file === pendingAction.file) {
+          // Still on the same file — keep buttons greyed, show feedback in progPages
+          pb.disabled = true;
+          cb.disabled = true;
+          const pageLabel = job.current_page > 0 ? `page ${job.current_page} of ${job.total_pages}` : 'starting…';
+          if (pendingAction.type === 'pausing') {
+            pb.textContent = '⏸ Finishing page…';
+            cb.textContent = '✕ Cancel';
+            document.getElementById('progPages').textContent = `⏸ Pausing — finishing ${pageLabel}`;
+          } else {
+            cb.textContent = '✕ Finishing page…';
+            pb.textContent = '⏸ Pause';
+            document.getElementById('progPages').textContent = `✕ Cancelling — finishing ${pageLabel}`;
+          }
+        } else {
+          // No pending action (or file changed) — restore buttons and show page count
+          if (pendingAction) {
+            pendingAction = null;
+            toast('Done — moving to next file in queue', 'ok');
+          }
+          pb.disabled = false; pb.textContent = '⏸ Pause';
+          cb.disabled = false; cb.textContent = '✕ Cancel';
+          document.getElementById('progPages').textContent =
+            job.current_page === 0 ? 'Starting…' : `Page ${job.current_page} of ${job.total_pages}`;
+        }
       } else {
+        if (pendingAction) pendingAction = null;
         pw.classList.remove('visible');
         iw.style.display = '';
       }
@@ -896,4 +927,4 @@ def ui():
 </script>
 </body>
 </html>
-"""
+""", headers={"Cache-Control": "no-store"})
