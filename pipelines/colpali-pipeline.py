@@ -796,6 +796,13 @@ class Pipeline:
                 ],
                 "max_tokens": 4096,
                 "stream": True,
+                # Disable thinking/reasoning mode for Qwen3 models — otherwise
+                # citations get buried in <think> blocks and never reach output.
+                **(
+                    {"thinking": {"type": "disabled"}}
+                    if "qwen3" in model.lower()
+                    else {}
+                ),
             },
             stream=True,
             timeout=180,
