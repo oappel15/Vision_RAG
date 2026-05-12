@@ -63,7 +63,7 @@ class Pipeline:
         IMAGE_CACHE_DIR: str = "/app/pipelines/cache/images"
 
     def __init__(self):
-        self.name = "ColQwen2 Visual RAG"
+        self.name = "Search"
         self.valves = self.Valves()
         self.model = None
         self.processor = None
@@ -617,8 +617,8 @@ class Pipeline:
     # ── VLM helpers ───────────────────────────────────────────────────
 
     def _expand_refs(self, text: str, hits, cited: set) -> str:
-        """Replace [REF:N ...] variants with bold page links.
-        Handles: [REF:1], [REF:1, REF:2], [REF:1, 2], [REF:1, Page 26],
+        """Replace [REF:N ...] and (REF:N ...) variants with bold page links.
+        Handles: [REF:1], (REF:1), [REF:1, REF:2], [REF:1, 2], [REF:1, Page 26],
                  [REF:1, REF:2, Page 10], and similar VLM output variations.
         """
 
@@ -649,9 +649,9 @@ class Pipeline:
                     )
             return " ".join(parts) if parts else m.group(0)
 
-        # Broad pattern: matches [REF:N ...] with any content up to closing ]
+        # Matches both [REF:N ...] and (REF:N ...) with any content up to closing bracket
         return re.sub(
-            r"\[REF\s*:\s*[^\]]+\]",
+            r"[\[(]REF\s*:\s*[^\])]+[\])]",
             _sub,
             text,
             flags=re.IGNORECASE,
@@ -827,15 +827,17 @@ class Pipeline:
                     text = carry + delta
                     carry = ""
 
-                    # Hold back from the first unclosed [ (multi-ref safe)
-                    open_pos = text.find("[")
-                    while open_pos != -1:
-                        close_pos = text.find("]", open_pos)
-                        if close_pos == -1:
-                            carry = text[open_pos:]
-                            text = text[:open_pos]
-                            break
-                        open_pos = text.find("[", close_pos + 1)
+                    # Hold back from the first unclosed [ or ( (multi-ref safe)
+                    for opener in ("[", "("):
+                        closer = "]" if opener == "[" else ")"
+                        open_pos = text.find(opener)
+                        while open_pos != -1:
+                            close_pos = text.find(closer, open_pos)
+                            if close_pos == -1:
+                                carry = text[open_pos:]
+                                text = text[:open_pos]
+                                break
+                            open_pos = text.find(opener, close_pos + 1)
 
                     text = self._expand_refs(text, hits, cited)
                     text = self._linkify_plain_pages(text, hits, cited)
