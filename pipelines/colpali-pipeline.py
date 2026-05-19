@@ -13,6 +13,10 @@ from typing import List, Literal, Optional
 
 import torch
 from PIL import Image
+
+# Allow very large images (engineering drawings, multi-page schematics).
+# Pillow's default limit is ~178MP which is too small for large pages at high DPI.
+Image.MAX_IMAGE_PIXELS = 500_000_000  # 500 megapixels
 from pydantic import BaseModel, model_validator
 from pdf2image import convert_from_path
 from qdrant_client import QdrantClient
