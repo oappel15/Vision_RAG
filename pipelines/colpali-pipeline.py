@@ -455,13 +455,13 @@ class Pipeline:
                 user_labels[lbl] = files
 
         lines = ["**Available Labels** — case-insensitive\n"]
-        lines.append("Copy a snippet below and paste it before your question:\n")
+        lines.append("Copy a snippet and paste before your question:\n")
 
         if user_labels:
             lines.append("### Custom Labels")
             for lbl in sorted(user_labels.keys(), key=str.lower):
                 files = user_labels[lbl]
-                snippet = f'/label:"{lbl}"' if " " in lbl or "/" in lbl else f"/label:{lbl}"
+                snippet = f'label:"{lbl}"' if " " in lbl or "/" in lbl else f"label:{lbl}"
                 count = len(files)
                 lines.append(
                     f"  - `{snippet}` — {count} doc{'s' if count != 1 else ''}"
@@ -475,16 +475,16 @@ class Pipeline:
                 if lbl.lower().endswith(".pdf"):
                     continue
                 files = auto_labels[lbl]
-                snippet = f'/label:"{lbl}"' if " " in lbl or "/" in lbl else f"/label:{lbl}"
+                snippet = f'label:"{lbl}"' if " " in lbl or "/" in lbl else f"label:{lbl}"
                 lines.append(f"  - `{snippet}`")
             lines.append("")
 
         lines.append("---")
         lines.append(
-            "**Examples:**\n"
-            "  - `/label:toyota engine specs` — search Toyota docs only\n"
-            "  - `/label:Confluence project overview` — Confluence pages only\n"
-            "  - `/label:toyota /label:Confluence meeting notes` — both labels must match"
+            "**Usage:** paste a snippet, then type your question after it\n"
+            "  - `label:toyota engine specs` — search Toyota docs only\n"
+            "  - `label:Confluence project overview` — Confluence pages only\n"
+            "  - `label:toyota label:Confluence meeting notes` — both labels must match"
         )
 
         return "\n".join(lines)
