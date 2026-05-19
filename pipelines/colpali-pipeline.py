@@ -433,8 +433,6 @@ class Pipeline:
         # Build a map: label → list of filenames
         label_to_files: dict = {}
         for fn in indexed:
-            user_labels = all_labels.get(fn, [])
-            stem = pathlib.Path(fn).stem
             file_labels = self._get_file_labels(fn)
             for lbl in file_labels:
                 label_to_files.setdefault(lbl, []).append(fn)
@@ -445,20 +443,50 @@ class Pipeline:
                 "PDF Indexer dashboard (port 8082)."
             )
 
-        lines = ["**Available Labels**\n"]
-        lines.append(
-            "Use `label:name` in your query to filter. "
-            "Combine multiple: `label:arduino label:schematic query`\n"
-        )
-        # Sort: user labels first (not matching any filename), then auto labels
-        for lbl in sorted(label_to_files.keys(), key=str.lower):
-            files = label_to_files[lbl]
-            files_str = ", ".join(f"`{f}`" for f in files[:3])
-            if len(files) > 3:
-                files_str += f" +{len(files)-3} more"
-            lines.append(f"  - **`{lbl}`** ({len(files)} doc{'s' if len(files)!=1 else ''}: {files_str})")
+        # Separate user-defined labels from auto-generated ones
+        auto_labels = {}  # labels that are just filenames/stems
+        user_labels = {}  # labels explicitly added by users
+        all_filenames = set(indexed)
+        all_stems = {pathlib.Path(fn).stem for fn in indexed}
+        for lbl, files in label_to_files.items():
+            if lbl in all_filenames or lbl in all_stems:
+                auto_labels[lbl] = files
+            else:
+                user_labels[lbl] = files
 
-        lines.append(f"\n*{len(label_to_files)} labels across {len(indexed)} documents*")
+        lines = ["**Available Labels** — case-insensitive\n"]
+        lines.append("Copy a snippet below and paste it before your question:\n")
+
+        if user_labels:
+            lines.append("### Custom Labels")
+            for lbl in sorted(user_labels.keys(), key=str.lower):
+                files = user_labels[lbl]
+                snippet = f'label:"{lbl}"' if " " in lbl or "/" in lbl else f"label:{lbl}"
+                count = len(files)
+                lines.append(
+                    f"  - `{snippet}` — {count} doc{'s' if count != 1 else ''}"
+                )
+            lines.append("")
+
+        if auto_labels:
+            lines.append("### Document Names")
+            for lbl in sorted(auto_labels.keys(), key=str.lower):
+                # Only show stems (shorter), skip full filenames with .pdf
+                if lbl.lower().endswith(".pdf"):
+                    continue
+                files = auto_labels[lbl]
+                snippet = f'label:"{lbl}"' if " " in lbl or "/" in lbl else f"label:{lbl}"
+                lines.append(f"  - `{snippet}`")
+            lines.append("")
+
+        lines.append("---")
+        lines.append(
+            "**Examples:**\n"
+            "  - `label:toyota engine specs` — search Toyota docs only\n"
+            "  - `label:Confluence project overview` — Confluence pages only\n"
+            "  - `label:toyota label:Confluence meeting notes` — both labels must match"
+        )
+
         return "\n".join(lines)
 
     # ── indexing ─────────────────────────────────────────────────────
@@ -723,6 +751,7 @@ class Pipeline:
                             "page_number": page_num,
                             "image_filename": img_filename,
                             "labels": file_labels,
+                            "labels_lower": [l.lower() for l in file_labels],
                         },
                     )
                 ],
@@ -793,19 +822,18 @@ class Pipeline:
         # Build optional Qdrant filter for labels
         query_filter = None
         if label_filters:
-            # Each label filter requires the "labels" array to contain that value.
-            # Using MatchValue on an array field checks if the array contains the value.
-            # All conditions in "must" are ANDed together = all labels must be present.
+            # Filter against labels_lower for case-insensitive matching.
+            # All conditions in "must" are ANDed = all labels must be present.
             conditions = []
             for lbl in label_filters:
                 conditions.append(
                     FieldCondition(
-                        key="labels",
-                        match=MatchValue(value=lbl),
+                        key="labels_lower",
+                        match=MatchValue(value=lbl.lower()),
                     )
                 )
             query_filter = Filter(must=conditions)
-            log.info(f"Label filter applied: {label_filters}")
+            log.info(f"Label filter applied (case-insensitive): {label_filters}")
 
         return self.qdrant.query_points(
             collection_name=self.valves.COLLECTION_NAME,

@@ -92,7 +92,7 @@ def _patch_existing_labels():
             combined = _build_full_labels(filename, user_labels)
             qdrant.set_payload(
                 collection_name=COLLECTION_NAME,
-                payload={"labels": combined},
+                payload={"labels": combined, "labels_lower": [l.lower() for l in combined]},
                 points=FilterSelector(
                     filter=Filter(
                         must=[FieldCondition(key="source", match=MatchValue(value=filename))]
@@ -398,7 +398,7 @@ async def update_file_labels(filename: str, request_body: dict):
         qdrant = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
         qdrant.set_payload(
             collection_name=COLLECTION_NAME,
-            payload={"labels": combined},
+            payload={"labels": combined, "labels_lower": [l.lower() for l in combined]},
             points=FilterSelector(
                 filter=Filter(
                     must=[FieldCondition(key="source", match=MatchValue(value=filename))]
