@@ -914,6 +914,123 @@ def ui():
       border: 1px solid var(--border);
     }
     .modal-btn:hover { opacity: .85; }
+
+    /* ── Search card ── */
+    .search-row {
+      display: flex; gap: 10px; align-items: flex-start;
+    }
+    .search-input-wrap {
+      flex: 1; position: relative;
+    }
+    #searchInput {
+      width: 100%;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: var(--radius-sm);
+      padding: 11px 14px;
+      font-size: 14px;
+      outline: none;
+      transition: border-color .15s;
+    }
+    #searchInput:focus { border-color: var(--accent); }
+    #searchInput::placeholder { color: var(--text-muted); }
+
+    .label-chips {
+      display: flex; flex-wrap: wrap; gap: 6px;
+      margin-bottom: 12px; min-height: 0;
+    }
+    .label-chip {
+      display: inline-flex; align-items: center; gap: 5px;
+      background: var(--accent-bg);
+      color: var(--accent-hi);
+      border: 1px solid rgba(124,58,237,.25);
+      border-radius: 16px; padding: 4px 10px 4px 12px;
+      font-size: 12px; font-weight: 500;
+      animation: chipIn .2s ease;
+    }
+    @keyframes chipIn {
+      from { transform: scale(.85); opacity: 0; }
+      to   { transform: scale(1);   opacity: 1; }
+    }
+    .label-chip .chip-x {
+      background: none; border: none;
+      color: var(--accent-hi); opacity: .6;
+      cursor: pointer; font-size: 14px; line-height: 1;
+      padding: 0 2px;
+    }
+    .label-chip .chip-x:hover { opacity: 1; }
+
+    .autocomplete-dropdown {
+      display: none;
+      position: absolute; left: 0; right: 0; top: 100%;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-top: none;
+      border-radius: 0 0 var(--radius-sm) var(--radius-sm);
+      max-height: 200px; overflow-y: auto;
+      z-index: 20;
+    }
+    .autocomplete-dropdown.open { display: block; }
+    .ac-item {
+      padding: 8px 14px;
+      font-size: 13px;
+      cursor: pointer;
+      display: flex; justify-content: space-between; align-items: center;
+      color: var(--text);
+    }
+    .ac-item:hover, .ac-item.active {
+      background: var(--accent-bg);
+      color: var(--accent-hi);
+    }
+    .ac-item .ac-count {
+      font-size: 11px; color: var(--text-muted);
+    }
+    .ac-hint {
+      padding: 6px 14px;
+      font-size: 11px; color: var(--text-muted);
+      border-bottom: 1px solid var(--border);
+    }
+
+    #searchBtn {
+      background: linear-gradient(135deg, var(--accent), #4f46e5);
+      color: #fff; border: none;
+      border-radius: var(--radius-sm);
+      padding: 11px 20px;
+      font-size: 14px; font-weight: 600;
+      cursor: pointer; white-space: nowrap;
+      transition: opacity .15s;
+      flex-shrink: 0;
+    }
+    #searchBtn:hover { opacity: .88; }
+    #searchBtn:disabled { opacity: .4; cursor: default; }
+
+    .search-mode-toggle {
+      display: flex; gap: 0; margin-bottom: 14px;
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      overflow: hidden;
+    }
+    .search-mode-toggle button {
+      flex: 1; padding: 8px 14px;
+      background: var(--surface2);
+      color: var(--text-muted);
+      border: none; font-size: 13px; font-weight: 500;
+      cursor: pointer;
+      transition: background .15s, color .15s;
+    }
+    .search-mode-toggle button.active {
+      background: var(--accent-bg);
+      color: var(--accent-hi);
+    }
+    .search-mode-toggle button:hover:not(.active) {
+      background: var(--surface);
+    }
+
+    .search-copied {
+      font-size: 12px; color: var(--green);
+      margin-top: 8px; min-height: 18px;
+    }
   </style>
 </head>
 <body>
@@ -962,6 +1079,36 @@ def ui():
         <span id="uploadBtnIcon">⬆</span>
         <span id="uploadBtnLabel">Select a file first</span>
       </button>
+    </div>
+
+    <!-- Search card -->
+    <div class="card">
+      <div class="card-title">Search Documents</div>
+
+      <div class="search-mode-toggle">
+        <button id="modeAll" class="active" onclick="setSearchMode('all')">🌍 Search All (YOLO)</button>
+        <button id="modeLabels" onclick="setSearchMode('labels')">🏷 Filter by Labels</button>
+      </div>
+
+      <div id="labelFilterArea" style="display:none">
+        <div class="label-chips" id="selectedLabels"></div>
+        <div style="position:relative">
+          <input type="text" id="labelInput" placeholder="Type to find labels…"
+                 autocomplete="off"
+                 style="width:100%; background:var(--surface2); border:1px solid var(--border);
+                        color:var(--text); border-radius:var(--radius-sm);
+                        padding:8px 12px; font-size:13px; outline:none; margin-bottom:12px;" />
+          <div class="autocomplete-dropdown" id="acDropdown"></div>
+        </div>
+      </div>
+
+      <div class="search-row">
+        <div class="search-input-wrap">
+          <input type="text" id="searchInput" placeholder="What are you looking for?" />
+        </div>
+        <button id="searchBtn" onclick="doSearch()">Search</button>
+      </div>
+      <div class="search-copied" id="searchCopied"></div>
     </div>
 
     <!-- Indexing status card -->
@@ -1023,6 +1170,214 @@ def ui():
 </div>
 
 <script>
+  // ── Search card ─────────────────────────────────────────────────────
+  let searchMode = 'all'; // 'all' or 'labels'
+  let selectedSearchLabels = []; // labels currently selected as filters
+  let allKnownLabels = []; // { label, count } fetched from server
+  let acIndex = -1; // active index in autocomplete dropdown
+
+  function setSearchMode(mode) {
+    searchMode = mode;
+    document.getElementById('modeAll').className = mode === 'all' ? 'active' : '';
+    document.getElementById('modeLabels').className = mode === 'labels' ? 'active' : '';
+    document.getElementById('labelFilterArea').style.display = mode === 'labels' ? '' : 'none';
+    if (mode === 'labels') {
+      loadAllKnownLabels();
+      document.getElementById('labelInput').focus();
+    }
+  }
+
+  async function loadAllKnownLabels() {
+    try {
+      // Fetch labels per file to build label -> doc count
+      const r = await fetch('/labels');
+      const data = await r.json(); // { filename: [labels], ... }
+      const counts = {};
+      // Also include auto-labels (filename + stem)
+      for (const [fn, labels] of Object.entries(data)) {
+        const stem = fn.replace(/\.pdf$/i, '');
+        const all = [fn, stem, ...labels];
+        const seen = new Set();
+        all.forEach(l => {
+          const lower = l.toLowerCase();
+          if (!seen.has(lower)) {
+            seen.add(lower);
+            counts[l] = (counts[l] || 0) + 1;
+          }
+        });
+      }
+      // Also count files that only have auto-labels (not in labels.json)
+      const sr = await fetch('/status');
+      const sdata = await sr.json();
+      (sdata.indexed_files || []).forEach(fn => {
+        const stem = fn.replace(/\.pdf$/i, '');
+        if (!counts[fn]) counts[fn] = 1;
+        if (!counts[stem]) counts[stem] = 1;
+      });
+      allKnownLabels = Object.entries(counts)
+        .map(([label, count]) => ({ label, count }))
+        .sort((a, b) => a.label.toLowerCase().localeCompare(b.label.toLowerCase()));
+    } catch (_) {}
+  }
+
+  // Autocomplete for label input
+  const labelInput = document.getElementById('labelInput');
+  const acDropdown = document.getElementById('acDropdown');
+
+  labelInput.addEventListener('input', () => {
+    const q = labelInput.value.trim().toLowerCase();
+    renderAcDropdown(q);
+  });
+
+  labelInput.addEventListener('focus', () => {
+    renderAcDropdown(labelInput.value.trim().toLowerCase());
+  });
+
+  labelInput.addEventListener('keydown', e => {
+    const items = acDropdown.querySelectorAll('.ac-item');
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      acIndex = Math.min(acIndex + 1, items.length - 1);
+      updateAcActive(items);
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      acIndex = Math.max(acIndex - 1, 0);
+      updateAcActive(items);
+    } else if (e.key === 'Enter') {
+      e.preventDefault();
+      if (acIndex >= 0 && items[acIndex]) {
+        selectLabel(items[acIndex].dataset.label);
+      } else if (labelInput.value.trim()) {
+        // Allow typing a custom label not in the list
+        selectLabel(labelInput.value.trim());
+      }
+    } else if (e.key === 'Escape') {
+      acDropdown.classList.remove('open');
+    }
+  });
+
+  // Close dropdown when clicking outside
+  document.addEventListener('click', e => {
+    if (!e.target.closest('#labelFilterArea')) {
+      acDropdown.classList.remove('open');
+    }
+  });
+
+  function renderAcDropdown(q) {
+    const already = new Set(selectedSearchLabels.map(l => l.toLowerCase()));
+    const filtered = allKnownLabels.filter(
+      item => !already.has(item.label.toLowerCase()) &&
+              (q === '' || item.label.toLowerCase().includes(q))
+    );
+    acDropdown.innerHTML = '';
+    acIndex = -1;
+    if (filtered.length === 0 && !q) {
+      acDropdown.innerHTML = '<div class="ac-hint">No labels available</div>';
+      acDropdown.classList.add('open');
+      return;
+    }
+    if (filtered.length === 0) {
+      acDropdown.innerHTML = '<div class="ac-hint">No matches — press Enter to use as custom label</div>';
+      acDropdown.classList.add('open');
+      return;
+    }
+    if (q === '') {
+      acDropdown.innerHTML = '<div class="ac-hint">All labels — type to filter</div>';
+    }
+    filtered.slice(0, 15).forEach(item => {
+      const div = document.createElement('div');
+      div.className = 'ac-item';
+      div.dataset.label = item.label;
+      // Highlight matching part
+      const idx = item.label.toLowerCase().indexOf(q);
+      let display = item.label;
+      if (q && idx >= 0) {
+        display = item.label.slice(0, idx) +
+                  '<strong>' + item.label.slice(idx, idx + q.length) + '</strong>' +
+                  item.label.slice(idx + q.length);
+      }
+      div.innerHTML = `<span>${display}</span><span class="ac-count">${item.count} doc${item.count !== 1 ? 's' : ''}</span>`;
+      div.addEventListener('mousedown', e => {
+        e.preventDefault();
+        selectLabel(item.label);
+      });
+      acDropdown.appendChild(div);
+    });
+    if (filtered.length > 15) {
+      acDropdown.innerHTML += `<div class="ac-hint">${filtered.length - 15} more…</div>`;
+    }
+    acDropdown.classList.add('open');
+  }
+
+  function updateAcActive(items) {
+    items.forEach((el, i) => el.classList.toggle('active', i === acIndex));
+    if (items[acIndex]) items[acIndex].scrollIntoView({ block: 'nearest' });
+  }
+
+  function selectLabel(label) {
+    label = label.trim();
+    if (!label) return;
+    if (selectedSearchLabels.some(l => l.toLowerCase() === label.toLowerCase())) return;
+    selectedSearchLabels.push(label);
+    renderSelectedLabels();
+    labelInput.value = '';
+    acDropdown.classList.remove('open');
+    labelInput.focus();
+  }
+
+  function removeSearchLabel(label) {
+    selectedSearchLabels = selectedSearchLabels.filter(l => l !== label);
+    renderSelectedLabels();
+  }
+
+  function renderSelectedLabels() {
+    const container = document.getElementById('selectedLabels');
+    container.innerHTML = '';
+    selectedSearchLabels.forEach(label => {
+      const chip = document.createElement('span');
+      chip.className = 'label-chip';
+      chip.innerHTML = `🏷 ${label.replace(/</g,'&lt;')} <button class="chip-x" title="Remove">&times;</button>`;
+      chip.querySelector('.chip-x').addEventListener('click', () => removeSearchLabel(label));
+      container.appendChild(chip);
+    });
+  }
+
+  function doSearch() {
+    const query = document.getElementById('searchInput').value.trim();
+    if (!query) { document.getElementById('searchInput').focus(); return; }
+
+    // Build the full query with label prefixes
+    let fullQuery = '';
+    if (searchMode === 'labels' && selectedSearchLabels.length) {
+      const prefixes = selectedSearchLabels.map(l => {
+        return l.includes(' ') ? `label:"${l}"` : `label:${l}`;
+      });
+      fullQuery = prefixes.join(' ') + ' ' + query;
+    } else {
+      fullQuery = query;
+    }
+
+    // Copy to clipboard and show feedback
+    navigator.clipboard.writeText(fullQuery).then(() => {
+      document.getElementById('searchCopied').textContent =
+        '✓ Copied to clipboard — paste in Open WebUI chat with @Search';
+      setTimeout(() => {
+        document.getElementById('searchCopied').textContent = '';
+      }, 4000);
+    }).catch(() => {});
+
+    // Also try to open Open WebUI in a new tab
+    const owUrl = `${window.location.protocol}//${window.location.hostname}:3000`;
+    window.open(owUrl, '_blank');
+
+    toast(`Query ready: ${fullQuery}`, 'ok');
+  }
+
+  // Enter key triggers search
+  document.getElementById('searchInput').addEventListener('keydown', e => {
+    if (e.key === 'Enter') doSearch();
+  });
+
   // ── Label rows (upload form) ──────────────────────────────────────
   function addLabelRow(value = '') {
     const container = document.getElementById('labelRows');

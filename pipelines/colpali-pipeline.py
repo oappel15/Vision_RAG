@@ -424,6 +424,43 @@ class Pipeline:
 
         return "\n".join(lines)
 
+    def _format_labels_list(self) -> str:
+        """Return a formatted list of all available labels for filtering."""
+        all_labels = self._load_labels()
+        state = self._load_state()
+        indexed = state.get("indexed_files", [])
+
+        # Build a map: label → list of filenames
+        label_to_files: dict = {}
+        for fn in indexed:
+            user_labels = all_labels.get(fn, [])
+            stem = pathlib.Path(fn).stem
+            file_labels = self._get_file_labels(fn)
+            for lbl in file_labels:
+                label_to_files.setdefault(lbl, []).append(fn)
+
+        if not label_to_files:
+            return (
+                "No labels found. Upload documents with labels via the "
+                "PDF Indexer dashboard (port 8082)."
+            )
+
+        lines = ["**Available Labels**\n"]
+        lines.append(
+            "Use `label:name` in your query to filter. "
+            "Combine multiple: `label:arduino label:schematic query`\n"
+        )
+        # Sort: user labels first (not matching any filename), then auto labels
+        for lbl in sorted(label_to_files.keys(), key=str.lower):
+            files = label_to_files[lbl]
+            files_str = ", ".join(f"`{f}`" for f in files[:3])
+            if len(files) > 3:
+                files_str += f" +{len(files)-3} more"
+            lines.append(f"  - **`{lbl}`** ({len(files)} doc{'s' if len(files)!=1 else ''}: {files_str})")
+
+        lines.append(f"\n*{len(label_to_files)} labels across {len(indexed)} documents*")
+        return "\n".join(lines)
+
     # ── indexing ─────────────────────────────────────────────────────
 
     def _index_local_pdfs(self):
@@ -1298,6 +1335,10 @@ class Pipeline:
         # User status query
         if query.strip().lower() in ("status", "indexing status", "/status"):
             return self._format_index_status()
+
+        # List available labels
+        if query.strip().lower() in ("/labels", "labels", "list labels"):
+            return self._format_labels_list()
 
         # Normal query → streaming generator
         return self._pipe_stream(query)
