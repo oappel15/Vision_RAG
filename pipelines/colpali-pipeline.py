@@ -795,6 +795,9 @@ class Pipeline:
         matches = re.findall(pattern, clean, re.IGNORECASE)
         for quoted, unquoted in matches:
             val = (quoted or unquoted).strip()
+            # Strip markdown backticks that may be captured when the VLM
+            # or chat history includes `label:xxx` code spans
+            val = val.strip('`')
             if val:
                 label_filters.append(val)
 
@@ -1341,7 +1344,12 @@ class Pipeline:
         if not query:
             return "Please ask a question about your documents."
 
-        log.info(f"Query: {query}")
+        log.info(f"Query: {query[:120]}")
+
+        # Ignore Open WebUI system queries (auto-tagging, title generation, etc.)
+        # These contain the full chat history and would trigger false label matches.
+        if query.strip().startswith("### Task:") or query.strip().startswith("### Instructions:"):
+            return ""
 
         # Internal trigger from pdf-ingest sidecar
         if query.strip() == "__index_now__":
