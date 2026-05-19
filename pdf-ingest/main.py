@@ -56,6 +56,53 @@ def _save_labels(labels: dict):
         json.dump(labels, f, indent=2)
     os.replace(tmp, str(LABELS_FILE))
 
+
+def _build_full_labels(filename: str, user_labels: list = None) -> list:
+    """Build the full labels list (auto + user), deduped, matching pipeline logic."""
+    stem = pathlib.Path(filename).stem
+    combined, seen = [], set()
+    for label in [filename, stem] + (user_labels or []):
+        lower = label.lower()
+        if lower not in seen:
+            seen.add(lower)
+            combined.append(label)
+    return combined
+
+
+@app.on_event("startup")
+def _patch_existing_labels():
+    """On startup, patch default labels into Qdrant for any indexed docs missing them."""
+    if not STATE_FILE.exists():
+        return
+    try:
+        with open(STATE_FILE) as f:
+            state = json.load(f)
+    except Exception:
+        return
+
+    indexed = state.get("indexed_files", [])
+    if not indexed:
+        return
+
+    all_labels = _load_labels()
+    try:
+        qdrant = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT, timeout=10)
+        for filename in indexed:
+            user_labels = all_labels.get(filename, [])
+            combined = _build_full_labels(filename, user_labels)
+            qdrant.set_payload(
+                collection_name=COLLECTION_NAME,
+                payload={"labels": combined},
+                points=FilterSelector(
+                    filter=Filter(
+                        must=[FieldCondition(key="source", match=MatchValue(value=filename))]
+                    )
+                ),
+            )
+            log.info(f"Startup: patched labels for {filename}: {combined}")
+    except Exception as e:
+        log.warning(f"Startup label patch failed (Qdrant may not be ready): {e}")
+
 app.mount("/pdfs", StaticFiles(directory=str(PDF_DIR)), name="pdfs")
 
 
@@ -330,7 +377,9 @@ def get_file_labels(filename: str):
 
 @app.put("/labels/{filename}")
 async def update_file_labels(filename: str, request_body: dict):
-    """Update labels for a specific file. Body: {"labels": ["label1", ...]}"""
+    """Update labels for a specific file. Body: {"labels": ["label1", ...]}
+    Also patches labels directly into Qdrant so existing vectors are immediately filterable.
+    """
     all_labels = _load_labels()
     new_labels = request_body.get("labels", []) if request_body else []
     new_labels = [str(l).strip() for l in new_labels if str(l).strip()]
@@ -339,7 +388,29 @@ async def update_file_labels(filename: str, request_body: dict):
     else:
         all_labels.pop(filename, None)
     _save_labels(all_labels)
-    return {"filename": filename, "labels": new_labels}
+
+    # Build the full labels list (auto + user) matching pipeline logic
+    combined = _build_full_labels(filename, new_labels)
+
+    # Patch labels on existing Qdrant points for this file
+    qdrant_ok = True
+    try:
+        qdrant = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
+        qdrant.set_payload(
+            collection_name=COLLECTION_NAME,
+            payload={"labels": combined},
+            points=FilterSelector(
+                filter=Filter(
+                    must=[FieldCondition(key="source", match=MatchValue(value=filename))]
+                )
+            ),
+        )
+        log.info(f"Qdrant labels patched for source={filename}: {combined}")
+    except Exception as e:
+        qdrant_ok = False
+        log.warning(f"Qdrant label patch failed for {filename}: {e}")
+
+    return {"filename": filename, "labels": new_labels, "qdrant_patched": qdrant_ok}
 
 
 @app.get("/all-labels")
