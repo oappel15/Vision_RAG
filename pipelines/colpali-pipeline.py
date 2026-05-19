@@ -8,12 +8,12 @@ description: Visual RAG pipeline using ColQwen2 multi-vector MaxSim + Qdrant + O
 """
 
 import asyncio
-import os, json, base64, io, logging, pathlib, hashlib, re, threading, time, gc, uuid
+import os, json, base64, io, logging, pathlib, hashlib, re, threading, time, gc, typing, uuid
 from typing import List, Literal, Optional
 
 import torch
 from PIL import Image
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 from pdf2image import convert_from_path
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
@@ -52,7 +52,28 @@ class Pipeline:
         SCORE_THRESHOLD: float = 0.0
         # ── VLM backend ── set VLM_PROVIDER to "ollama" to use local Ollama instead
         VLM_PROVIDER: Literal["openrouter", "ollama"] = "openrouter"
-        OPENROUTER_MODEL: str = "qwen/qwen3-vl-30b-a3b-instruct"
+        # Note: only include models whose production OpenRouter deployment
+        # actually accepts image inputs. OpenRouter's model card "image"
+        # modality flag is sometimes ahead of upstream provider support
+        # (e.g. moonshotai/kimi-k2.6 advertises vision but the default-
+        # routed AtlasCloud deployment rejects image payloads with HTTP 400).
+        # For such models we pin the upstream provider via PROVIDER_PINS
+        # in _stream_vlm (see provider routing logic there).
+        OPENROUTER_MODEL: Literal[
+            "qwen/qwen3-vl-30b-a3b-instruct",
+            "qwen/qwen3-vl-235b-a22b-instruct",
+            "qwen/qwen3-vl-235b-a22b-thinking",
+            "qwen/qwen3.5-122b-a10b",
+            "qwen/qwen3.6-35b-a3b",
+            "qwen/qwen3.6-plus",
+            "google/gemini-3.1-pro-preview",
+            "google/gemma-4-31b-it",
+            "openai/gpt-5.2",
+            "anthropic/claude-opus-4.7",
+            "z-ai/glm-4.6v",
+            "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
+            "moonshotai/kimi-k2.6",  # pinned to Moonshot AI provider (only one that accepts images)
+        ] = "qwen/qwen3-vl-30b-a3b-instruct"
         THUMBNAIL_SCORE_THRESHOLD: float = (
             0.0  # min score for cited page to show thumbnail; 0 = show all
         )
@@ -61,6 +82,40 @@ class Pipeline:
         SHOW_SOURCE_PAGES: bool = True
         SERVER_HOST: str = os.getenv("SERVER_HOST", "localhost")
         IMAGE_CACHE_DIR: str = "/app/pipelines/cache/images"
+        # ── Page rendering quality (affects images sent to the VLM) ──
+        # Higher DPI improves small-text reading (schematics, datasheets)
+        # at the cost of larger payloads and slower indexing. Only applied
+        # to newly-indexed pages — delete IMAGE_CACHE_DIR and re-index to
+        # regenerate existing pages at the new DPI.
+        INDEXING_DPI: int = 300
+        INDEXING_JPEG_QUALITY: int = 90
+
+        @model_validator(mode="before")
+        @classmethod
+        def _sanitize_stale_openrouter_model(cls, data):
+            """Drop a persisted OPENROUTER_MODEL value that is no longer in the
+            Literal[...] choices (e.g. a model ID that was removed from the
+            dropdown or from OpenRouter's catalog). Without this, Open WebUI
+            replaying a stale valves.json would crash pipeline startup with a
+            Pydantic literal_error. We silently fall back to the field default.
+            """
+            if not isinstance(data, dict):
+                return data
+            model_value = data.get("OPENROUTER_MODEL")
+            if model_value is None:
+                return data
+            allowed = typing.get_args(
+                cls.model_fields["OPENROUTER_MODEL"].annotation
+            )
+            if model_value not in allowed:
+                log.warning(
+                    "Discarding stale OPENROUTER_MODEL %r from persisted valves "
+                    "(not in current choices %s); falling back to default.",
+                    model_value,
+                    list(allowed),
+                )
+                data.pop("OPENROUTER_MODEL", None)
+            return data
 
     def __init__(self):
         self.name = "Search"
@@ -116,7 +171,11 @@ class Pipeline:
         safe_name = pathlib.Path(filename).stem
         img_filename = f"{safe_name}_p{page_num}.jpg"
         img_path = os.path.join(self.valves.IMAGE_CACHE_DIR, img_filename)
-        page_img.save(img_path, format="JPEG", quality=85)
+        page_img.save(
+            img_path,
+            format="JPEG",
+            quality=self.valves.INDEXING_JPEG_QUALITY,
+        )
         # Invalidate stale thumbnail so it gets regenerated on next query
         thumb_path = img_path.replace(".jpg", "_thumb.jpg")
         if os.path.exists(thumb_path):
@@ -172,9 +231,24 @@ class Pipeline:
 
         log.info("=== Model loading starting ===")
 
-        self.valves.OPENROUTER_MODEL = os.getenv(
-            "OPENROUTER_MODEL", self.valves.OPENROUTER_MODEL
-        )
+        # Allow env var override, but only if the value is one of the allowed
+        # Literal choices declared on the Valves model — otherwise Pydantic
+        # would raise on assignment. Fall back to the default silently.
+        _env_model = os.getenv("OPENROUTER_MODEL")
+        if _env_model:
+            _allowed = typing.get_args(
+                self.Valves.model_fields["OPENROUTER_MODEL"].annotation
+            )
+            if _env_model in _allowed:
+                self.valves.OPENROUTER_MODEL = _env_model
+            else:
+                log.warning(
+                    "OPENROUTER_MODEL env var %r is not in allowed choices %s; "
+                    "using default %r",
+                    _env_model,
+                    list(_allowed),
+                    self.valves.OPENROUTER_MODEL,
+                )
         self.valves.COLLECTION_NAME = os.getenv(
             "TARGET_KNOWLEDGE", self.valves.COLLECTION_NAME
         )
@@ -530,7 +604,10 @@ class Pipeline:
                 break
             # Convert one page at a time to avoid loading the full PDF into memory
             page_img = convert_from_path(
-                str(pdf_path), dpi=200, first_page=page_num, last_page=page_num
+                str(pdf_path),
+                dpi=self.valves.INDEXING_DPI,
+                first_page=page_num,
+                last_page=page_num,
             )[0].convert("RGB")
 
             img_filename = self._save_page_image(page_img, filename, page_num)
@@ -762,6 +839,114 @@ class Pipeline:
                     }
                 )
 
+        # ── Reasoning policy per model family ──
+        # Some models burn an enormous reasoning budget that consumes most
+        # of max_tokens before producing any visible content, causing the
+        # answer to be truncated (finish_reason='length'). For those, fully
+        # disable reasoning. For others, keep reasoning but exclude it from
+        # the visible stream (preserves accuracy on hard visual tasks
+        # without leaking <think> blocks into the user-facing answer).
+        m = model.lower()
+        REASONING_RUNAWAY_MODELS = (
+            "qwen3.5",  # Qwen 3.5 122B/35B/9B reasoning generates 10K+ tokens
+            "qwen3.6",  # Same family behavior
+            "nemotron-3",  # Nemotron 3 reasoning variants
+            "kimi-k2",  # Kimi K2.x reasons silently for minutes via Moonshot;
+            #            reasoning tokens never reach the stream so we'd
+            #            otherwise wait forever. Disabling reasoning lets
+            #            content stream immediately.
+        )
+        if any(tag in m for tag in REASONING_RUNAWAY_MODELS):
+            reasoning_param = {"enabled": False}
+        else:
+            reasoning_param = {"exclude": True}
+
+        # ── Provider routing pins ──
+        # Some models on OpenRouter route by default to providers whose
+        # production deployment doesn't honor the model's full capabilities.
+        # Most notable: moonshotai/kimi-k2.6 is served by multiple providers
+        # but only Moonshot AI's own endpoint accepts image inputs — the
+        # default load-balanced route (AtlasCloud) returns HTTP 400 on any
+        # image payload. For such models we pin the upstream provider via
+        # OpenRouter's `provider.only` + `allow_fallbacks: false` mechanism.
+        PROVIDER_PINS = {
+            # model_id (substring match) -> required provider slug
+            "moonshotai/kimi-k2.6": "moonshotai",
+        }
+        provider_param = None
+        for model_tag, provider_slug in PROVIDER_PINS.items():
+            if model_tag in m:
+                provider_param = {
+                    "only": [provider_slug],
+                    "allow_fallbacks": False,
+                }
+                break
+
+        # ── Schematic-mode detection ──
+        # Schematics, datasheets with pinouts, and circuit diagrams require
+        # a different reading discipline than prose documents. Without
+        # special instructions, mid-tier VLMs (Qwen3-VL-instruct, GLM-4.6v,
+        # smaller models) tend to "autocomplete" the answer from training
+        # data instead of literally transcribing what's printed in the
+        # image — e.g. GLM-4.6v outputting a 40-pin pinout for the 28-pin
+        # ATmega328 because it pattern-matched on "ATmega + Arduino" and
+        # recalled a different chip in the family.
+        #
+        # We detect schematic-style queries by either:
+        #   (a) keywords in the user query (pinout, schematic, circuit, etc.)
+        #   (b) any retrieved filename containing "schematic"
+        # When triggered, we append a schematic-specific addendum to the
+        # system prompt. Frontier models (Gemini/GPT/Claude) ignore the
+        # extra instructions when not relevant; mid-tier models get a much
+        # stronger anchor to "transcribe, don't recall".
+        SCHEMATIC_KEYWORDS = (
+            "schematic", "pinout", "pin out", "pin-out", "pin number",
+            "circuit diagram", "net name", "netname", "ic pin",
+        )
+        query_lower = query.lower()
+        retrieved_filenames = " ".join(
+            (h.payload.get("source", "") or "") for h in hits
+        ).lower()
+        schematic_mode = (
+            any(kw in query_lower for kw in SCHEMATIC_KEYWORDS)
+            or "schematic" in retrieved_filenames
+        )
+        log.info(
+            "VLM POST → %s (reasoning=%s, schematic_mode=%s, provider=%s)",
+            model,
+            reasoning_param,
+            schematic_mode,
+            provider_param,
+        )
+
+        SCHEMATIC_ADDENDUM = (
+            "\n\nSCHEMATIC-MODE INSTRUCTIONS — apply when reading electrical "
+            "schematics, datasheet pinout diagrams, or circuit drawings:\n"
+            "1. TRANSCRIBE, do not RECALL. Even if you recognize the part "
+            "number, read every pin label DIRECTLY off the image. Do NOT "
+            "supply pin functions, alternate-function names, or pin counts "
+            "from your training data unless they are visibly printed on this "
+            "specific page. A part number like 'ATmega328' may appear in "
+            "many packages (DIP-28, TQFP-32, MLF-32); only use the package "
+            "actually shown.\n"
+            "2. Count pins BEFORE listing them. Look at the IC symbol and "
+            "state the package pin count explicitly (e.g. 'This is a 28-pin "
+            "DIP'). Your final table row count MUST match.\n"
+            "3. For IC pinout requests, work in two passes:\n"
+            "   - PASS 1: Scan the IC symbol's perimeter and list each pin "
+            "as 'pin N: <exact text printed next to that pin>'. Do not skip, "
+            "merge, reorder, or paraphrase labels.\n"
+            "   - PASS 2: Render the requested table from your PASS 1 list. "
+            "Verify the row count equals the pin count from step 2.\n"
+            "4. If a label is illegible, cropped, or you are not confident, "
+            "write '(unreadable)' for that pin — never guess.\n"
+            "5. Net names, test point labels, and reference designators are "
+            "only valid if PRINTED in this image. Do not import them from "
+            "datasheet knowledge.\n"
+            "6. After the table, briefly list any pins you marked unreadable "
+            "so the user knows what to verify manually."
+        )
+
         with _req.post(
             url,
             headers=headers,
@@ -790,28 +975,64 @@ class Pipeline:
                             "4. Chain citations when information spans multiple pages "
                             "(example: 'Connect A to B [REF:1], then B to C [REF:3].').\n"
                             "5. If none of the pages contain relevant information, say so plainly."
+                            + (SCHEMATIC_ADDENDUM if schematic_mode else "")
                         ),
                     },
                     {"role": "user", "content": content_parts},
                 ],
-                "max_tokens": 4096,
+                "max_tokens": 16384,
                 "stream": True,
-                # Disable thinking/reasoning mode for Qwen3 models — otherwise
-                # citations get buried in <think> blocks and never reach output.
-                **(
-                    {"thinking": {"type": "disabled"}}
-                    if "qwen3" in model.lower()
-                    else {}
-                ),
+                # Reasoning policy computed above based on model family:
+                #   - {"enabled": False} for runaway-reasoning models that
+                #     would otherwise burn all 16K tokens on hidden thinking
+                #     (Qwen 3.5/3.6, Nemotron 3 reasoning variants).
+                #   - {"exclude": True} for everything else: the model still
+                #     reasons (preserving accuracy on hard visual tasks like
+                #     schematics) but the reasoning trace is stripped from
+                #     the streamed output so it doesn't leak into the answer.
+                "reasoning": reasoning_param,
+                # Optional per-model provider pin (computed above). Only
+                # included when set, so default load-balancing is preserved
+                # for models that don't need an explicit upstream provider.
+                **({"provider": provider_param} if provider_param else {}),
             },
             stream=True,
             timeout=180,
         ) as resp:
             resp.raise_for_status()
             carry = ""
+            finish_reason = None
+            # ── Stream watchdog ──
+            # OpenRouter sends ': OPENROUTER PROCESSING' SSE comment frames
+            # as keepalives while upstream providers are working. These keep
+            # the TCP connection alive (so requests.timeout never fires) but
+            # don't carry any model output. If a provider gets stuck in a
+            # long reasoning phase or hangs entirely, we'd wait forever.
+            # Track wall-clock time since the last *meaningful* data chunk
+            # (one with actual content) and abort if too long passes with
+            # only keepalives or empty deltas.
+            STREAM_IDLE_TIMEOUT_S = 120  # max seconds without a content token
+            last_content_time = time.monotonic()
+            stream_aborted = False
             try:
                 for line in resp.iter_lines():
+                    # Watchdog: check elapsed time since last meaningful chunk
+                    if (
+                        time.monotonic() - last_content_time
+                        > STREAM_IDLE_TIMEOUT_S
+                    ):
+                        log.warning(
+                            "VLM stream idle >%ds with no content tokens "
+                            "(model=%s) — aborting. Upstream provider may "
+                            "be stuck in a long reasoning phase.",
+                            STREAM_IDLE_TIMEOUT_S,
+                            model,
+                        )
+                        stream_aborted = True
+                        break
                     if not line or not line.startswith(b"data: "):
+                        # SSE comments (':' prefix) and blank keepalives:
+                        # don't reset the watchdog — they're just heartbeats.
                         continue
                     data = line[6:]
                     if data == b"[DONE]":
@@ -820,9 +1041,16 @@ class Pipeline:
                     choices = parsed.get("choices", [])
                     if not choices:
                         continue
+                    # Track finish_reason — providers often only set it on the
+                    # final chunk. Logged after the loop so we can diagnose
+                    # "length" (max_tokens cutoff) vs "stop" (clean) vs others.
+                    if choices[0].get("finish_reason"):
+                        finish_reason = choices[0]["finish_reason"]
                     delta = choices[0]["delta"].get("content", "")
                     if not delta:
                         continue
+                    # Real content arrived — reset the watchdog.
+                    last_content_time = time.monotonic()
 
                     text = carry + delta
                     carry = ""
@@ -852,6 +1080,33 @@ class Pipeline:
                 carry = self._linkify_plain_pages(carry, hits, cited)
                 if carry:
                     yield carry
+
+            # If the watchdog killed the loop, surface a clear message to
+            # the user instead of leaving them with a half-empty answer.
+            if stream_aborted:
+                yield (
+                    f"\n\n*[Aborted: no content from `{model}` for "
+                    f"{STREAM_IDLE_TIMEOUT_S}s — provider may be hung or "
+                    f"stuck in extended reasoning. Try a faster model.]*"
+                )
+
+            # Log finish_reason so future truncations are diagnosable. Common
+            # values: "stop" (clean), "length" (hit max_tokens — answer was
+            # truncated), "content_filter", "error". When watchdog aborted,
+            # finish_reason is unset (we never received a terminal chunk).
+            if stream_aborted:
+                log.warning(
+                    "VLM stream aborted by idle watchdog (model=%s)", model
+                )
+            elif finish_reason and finish_reason != "stop":
+                log.warning(
+                    "VLM stream ended with finish_reason=%r (model=%s, "
+                    "max_tokens=16384). Consider bumping max_tokens if 'length'.",
+                    finish_reason,
+                    model,
+                )
+            else:
+                log.info("VLM stream ended cleanly (finish_reason=%r)", finish_reason)
 
     # ── streaming entry point ─────────────────────────────────────────
 
