@@ -1292,17 +1292,19 @@ class Pipeline:
 
     # ── streaming entry point ─────────────────────────────────────────
 
-    def _pipe_stream(self, query: str):
+    def _pipe_stream(self, query: str, label_filters: list = None):
         """Generator yielding streaming response chunks for a normal query."""
         try:
-            # Parse label filters from query (e.g. "label:arduino pinout diagram")
-            clean_query, label_filters = self._parse_label_filters(query)
-            search_query = clean_query if clean_query else query
+            search_query = query
+            label_filters = label_filters or []
 
             # Step 1 — show retrieval status immediately
             if label_filters:
                 filter_display = ", ".join(f"`{l}`" for l in label_filters)
-                yield f"> 🔍 Searching documents filtered by labels: {filter_display}\n\n"
+                yield (
+                    f"> 🔍 Searching documents filtered by labels: {filter_display}\n"
+                    f"> *Sticky filter — type `label:clear` to search all*\n\n"
+                )
             else:
                 yield "> 🔍 Searching all indexed documents…\n\n"
 
@@ -1402,5 +1404,44 @@ class Pipeline:
         if query.strip().lower() in ("/labels", "labels", "list labels"):
             return self._format_labels_list()
 
+        # ── Sticky label filters from chat history ───────────────────
+        # If the current message has label: prefixes, use those.
+        # If it has label:all or label:clear, search without filters.
+        # Otherwise, inherit the most recent label filters from the conversation.
+        clean_query, current_labels = self._parse_label_filters(query)
+        search_query = clean_query if clean_query else query
+
+        # Check for explicit clear
+        cleared = any(
+            lbl.lower() in ("all", "clear", "none", "reset")
+            for lbl in current_labels
+        )
+
+        if cleared:
+            # User explicitly cleared filters
+            label_filters = []
+            search_query = clean_query if clean_query else query
+        elif current_labels:
+            # User provided new labels — use them
+            label_filters = current_labels
+        else:
+            # No labels in current message — scan history for sticky filters
+            label_filters = []
+            # Walk backwards through previous user messages
+            for msg in reversed(messages[:-1]):
+                if msg.get("role") != "user":
+                    continue
+                content = msg.get("content", "")
+                # Skip system queries
+                if content.strip().startswith("### Task:") or content.strip().startswith("### Instructions:"):
+                    continue
+                _, hist_labels = self._parse_label_filters(content)
+                # Check if this message explicitly cleared
+                if any(lbl.lower() in ("all", "clear", "none", "reset") for lbl in hist_labels):
+                    break  # cleared — don't inherit anything
+                if hist_labels:
+                    label_filters = hist_labels
+                    break
+
         # Normal query → streaming generator
-        return self._pipe_stream(query)
+        return self._pipe_stream(search_query, label_filters)
