@@ -34,6 +34,7 @@ log = logging.getLogger("colpali-pipeline")
 log.setLevel(logging.DEBUG)
 
 STATE_FILE = "/app/pipelines/pipeline_state.json"
+LABELS_FILE = "/app/pipelines/labels.json"
 SCHEMA_VERSION = (
     3  # v1 = mean-pooled (broken), v2 = multi-vector MaxSim, v3 = UUID point IDs
 )
@@ -162,6 +163,33 @@ class Pipeline:
         with open(tmp, "w") as f:
             json.dump(state, f)
         os.replace(tmp, STATE_FILE)
+
+    def _load_labels(self) -> dict:
+        """Load labels.json: { "filename.pdf": ["label1", ...], ... }"""
+        if os.path.exists(LABELS_FILE):
+            try:
+                with open(LABELS_FILE) as f:
+                    return json.load(f)
+            except Exception:
+                pass
+        return {}
+
+    def _get_file_labels(self, filename: str) -> list:
+        """Return all labels for a file: always includes the filename itself."""
+        all_labels = self._load_labels()
+        user_labels = all_labels.get(filename, [])
+        # Always include the filename (without .pdf extension) as an implicit label
+        stem = pathlib.Path(filename).stem
+        auto_labels = [filename, stem]
+        # Combine: auto labels + user labels, deduped, preserving order
+        combined = []
+        seen = set()
+        for label in auto_labels + user_labels:
+            lower = label.lower()
+            if lower not in seen:
+                seen.add(lower)
+                combined.append(label)
+        return combined
 
     def _save_page_image(
         self, page_img: Image.Image, filename: str, page_num: int
@@ -381,10 +409,18 @@ class Pipeline:
 
         if indexed:
             lines.append(f"\n**Indexed files ({len(indexed)}):**")
+            all_labels = self._load_labels()
             for fn in indexed:
-                lines.append(f"  - {fn}")
+                file_labels = all_labels.get(fn, [])
+                label_str = f" [labels: {', '.join(file_labels)}]" if file_labels else ""
+                lines.append(f"  - {fn}{label_str}")
         else:
             lines.append("\nNo files indexed yet.")
+
+        lines.append(
+            "\n**Tip:** Use `label:name` prefix in your query to filter by label "
+            "(e.g. `label:arduino pinout diagram`)."
+        )
 
         return "\n".join(lines)
 
@@ -585,6 +621,10 @@ class Pipeline:
         total_pages = pdfinfo_from_path(str(pdf_path))["Pages"]
         log.info(f"    {filename}: {total_pages} total pages")
 
+        # Load labels for this file (includes auto-generated filename label)
+        file_labels = self._get_file_labels(filename)
+        log.info(f"    Labels for {filename}: {file_labels}")
+
         # Write index_job immediately so UI shows progress before first page completes
         state = self._load_state()
         state.setdefault("file_progress", {})
@@ -645,6 +685,7 @@ class Pipeline:
                             "source": filename,
                             "page_number": page_num,
                             "image_filename": img_filename,
+                            "labels": file_labels,
                         },
                     )
                 ],
@@ -668,7 +709,36 @@ class Pipeline:
 
     # ── search with MULTI-VECTOR MaxSim ──────────────────────────────
 
-    def _search(self, query: str, top_k: int = 5):
+    @staticmethod
+    def _parse_label_filters(query: str) -> tuple:
+        """Parse label filter prefixes from query.
+
+        Supports:
+          - labels:value       (single label, no spaces)
+          - labels:"my value"  (quoted, with spaces)
+          - Multiple labels: can repeat prefix
+
+        Returns (clean_query, label_list) where label_list may be empty.
+        """
+        label_filters = []
+        clean = query
+
+        # Match labels:"quoted value" or labels:unquoted_value
+        pattern = r'labels?:"([^"]+)"|labels?:(\S+)'
+        matches = re.findall(pattern, clean, re.IGNORECASE)
+        for quoted, unquoted in matches:
+            val = (quoted or unquoted).strip()
+            if val:
+                label_filters.append(val)
+
+        # Remove matched patterns from query
+        clean = re.sub(r'\s*labels?:"[^"]+"\s*', ' ', clean, flags=re.IGNORECASE)
+        clean = re.sub(r'\s*labels?:\S+\s*', ' ', clean, flags=re.IGNORECASE)
+        clean = clean.strip()
+
+        return clean, label_filters
+
+    def _search(self, query: str, top_k: int = 5, label_filters: list = None):
         self._query_active.set()
         try:
             batch = self.processor.process_queries([query])
@@ -683,9 +753,27 @@ class Pipeline:
         # ── Full multi-vector query (all query tokens) ──────────────
         log.info(f"Query encoded → {len(q_vecs)} tokens")
 
+        # Build optional Qdrant filter for labels
+        query_filter = None
+        if label_filters:
+            # Each label filter requires the "labels" array to contain that value.
+            # Using MatchValue on an array field checks if the array contains the value.
+            # All conditions in "must" are ANDed together = all labels must be present.
+            conditions = []
+            for lbl in label_filters:
+                conditions.append(
+                    FieldCondition(
+                        key="labels",
+                        match=MatchValue(value=lbl),
+                    )
+                )
+            query_filter = Filter(must=conditions)
+            log.info(f"Label filter applied: {label_filters}")
+
         return self.qdrant.query_points(
             collection_name=self.valves.COLLECTION_NAME,
             query=q_vecs,  # ← MULTI-VECTOR query
+            query_filter=query_filter,
             limit=top_k,
             search_params=SearchParams(exact=False),
             with_payload=True,
@@ -1113,15 +1201,31 @@ class Pipeline:
     def _pipe_stream(self, query: str):
         """Generator yielding streaming response chunks for a normal query."""
         try:
-            # Step 1 — show retrieval status immediately
-            yield "> 🔍 Searching indexed documents…\n\n"
+            # Parse label filters from query (e.g. "label:arduino pinout diagram")
+            clean_query, label_filters = self._parse_label_filters(query)
+            search_query = clean_query if clean_query else query
 
-            hits = self._search(query, top_k=self.valves.TOP_K)
+            # Step 1 — show retrieval status immediately
+            if label_filters:
+                filter_display = ", ".join(f"`{l}`" for l in label_filters)
+                yield f"> 🔍 Searching documents filtered by labels: {filter_display}\n\n"
+            else:
+                yield "> 🔍 Searching all indexed documents…\n\n"
+
+            hits = self._search(search_query, top_k=self.valves.TOP_K, label_filters=label_filters)
             if self.valves.SCORE_THRESHOLD > 0:
                 hits = [h for h in hits if h.score >= self.valves.SCORE_THRESHOLD]
 
             if not hits:
-                yield "No relevant pages found in the indexed documents."
+                if label_filters:
+                    filter_display = ", ".join(f"`{l}`" for l in label_filters)
+                    yield (
+                        f"No relevant pages found matching labels: {filter_display}.\n\n"
+                        "Try broadening your search by removing the label filter, "
+                        "or check the label names in the PDF Indexer dashboard."
+                    )
+                else:
+                    yield "No relevant pages found in the indexed documents."
                 return
 
             log.info(f"Retrieved {len(hits)} pages")
@@ -1141,7 +1245,7 @@ class Pipeline:
 
             # Step 3 — stream VLM answer
             cited: set = set()
-            yield from self._stream_vlm(query, hits, cited)
+            yield from self._stream_vlm(search_query, hits, cited)
 
             # Step 4 — source thumbnails (only cited pages above score threshold)
             if self.valves.SHOW_SOURCE_PAGES:

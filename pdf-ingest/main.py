@@ -8,9 +8,10 @@ import json
 import logging
 import os
 import pathlib
+from typing import Optional
 
 import requests
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from qdrant_client import QdrantClient
@@ -22,6 +23,7 @@ app = FastAPI()
 
 PDF_DIR = pathlib.Path(os.getenv("PDF_DIR", "/app/downloads"))
 STATE_FILE = pathlib.Path(os.getenv("STATE_FILE", "/app/pipelines/pipeline_state.json"))
+LABELS_FILE = pathlib.Path(os.getenv("LABELS_FILE", "/app/pipelines/labels.json"))
 WATCHER_STATE_FILE = pathlib.Path(os.getenv("WATCHER_STATE_FILE", "/app/watcher_state/watcher_state.json"))
 PIPELINES_URL = os.getenv("PIPELINES_URL", "http://pipelines:9099")
 PIPELINES_API_KEY = os.getenv("PIPELINES_API_KEY", "0p3n-w3bu!")
@@ -31,6 +33,28 @@ QDRANT_PORT = int(os.getenv("QDRANT_PORT", "6333"))
 COLLECTION_NAME = os.getenv("COLLECTION_NAME", "my_docs")
 
 PDF_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# ── Labels storage ────────────────────────────────────────────────────
+# labels.json: { "filename.pdf": ["label1", "label2", ...], ... }
+# The filename itself is always an implicit label (added at search time
+# by the pipeline), so it is NOT stored redundantly here.
+
+def _load_labels() -> dict:
+    if LABELS_FILE.exists():
+        try:
+            with open(LABELS_FILE) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+
+def _save_labels(labels: dict):
+    tmp = str(LABELS_FILE) + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(labels, f, indent=2)
+    os.replace(tmp, str(LABELS_FILE))
 
 app.mount("/pdfs", StaticFiles(directory=str(PDF_DIR)), name="pdfs")
 
@@ -104,7 +128,10 @@ def view_pdf_at_page(page: int, filename: str):
 
 
 @app.post("/upload")
-async def upload_pdf(file: UploadFile = File(...)):
+async def upload_pdf(
+    file: UploadFile = File(...),
+    labels: Optional[str] = Form(None),  # JSON array of label strings
+):
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are accepted.")
 
@@ -112,6 +139,21 @@ async def upload_pdf(file: UploadFile = File(...)):
     content = await file.read()
     with open(dest, "wb") as f:
         f.write(content)
+
+    # Parse and store user-supplied labels
+    user_labels = []
+    if labels:
+        try:
+            parsed = json.loads(labels)
+            if isinstance(parsed, list):
+                user_labels = [str(l).strip() for l in parsed if str(l).strip()]
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    if user_labels:
+        all_labels = _load_labels()
+        all_labels[file.filename] = user_labels
+        _save_labels(all_labels)
 
     # Fire-and-forget: trigger background indexing via existing pipeline API
     try:
@@ -130,7 +172,12 @@ async def upload_pdf(file: UploadFile = File(...)):
     except Exception:
         pass  # pipeline may still be starting up; indexing will run on next startup too
 
-    return {"status": "uploaded", "filename": file.filename, "size_bytes": len(content)}
+    return {
+        "status": "uploaded",
+        "filename": file.filename,
+        "size_bytes": len(content),
+        "labels": user_labels,
+    }
 
 
 @app.get("/status")
@@ -204,6 +251,12 @@ def delete_pdf(filename: str):
     if pdf_path.exists():
         pdf_path.unlink()
 
+    # Remove labels for this file
+    all_labels = _load_labels()
+    if filename in all_labels:
+        del all_labels[filename]
+        _save_labels(all_labels)
+
     if STATE_FILE.exists():
         with open(STATE_FILE) as f:
             state = json.load(f)
@@ -258,6 +311,46 @@ def delete_pdf(filename: str):
             log.warning(f"Failed to clean watcher_state for {filename}: {e}")
 
     return {"status": "deleted", "filename": filename, "qdrant_cleaned": qdrant_ok}
+
+
+# ── Labels API ────────────────────────────────────────────────────────
+
+@app.get("/labels")
+def get_all_labels():
+    """Return all labels for all files: { filename: [labels], ... }"""
+    return JSONResponse(_load_labels())
+
+
+@app.get("/labels/{filename}")
+def get_file_labels(filename: str):
+    """Return labels for a specific file."""
+    all_labels = _load_labels()
+    return JSONResponse(all_labels.get(filename, []))
+
+
+@app.put("/labels/{filename}")
+async def update_file_labels(filename: str, request_body: dict):
+    """Update labels for a specific file. Body: {"labels": ["label1", ...]}"""
+    all_labels = _load_labels()
+    new_labels = request_body.get("labels", []) if request_body else []
+    new_labels = [str(l).strip() for l in new_labels if str(l).strip()]
+    if new_labels:
+        all_labels[filename] = new_labels
+    else:
+        all_labels.pop(filename, None)
+    _save_labels(all_labels)
+    return {"filename": filename, "labels": new_labels}
+
+
+@app.get("/all-labels")
+def get_unique_labels():
+    """Return a flat deduplicated list of all labels used across all files."""
+    all_labels = _load_labels()
+    unique = set()
+    for labels_list in all_labels.values():
+        for label in labels_list:
+            unique.add(label)
+    return JSONResponse(sorted(unique))
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -597,6 +690,159 @@ def ui():
     }
     .q-badge.queued  { background: var(--surface2); color: var(--text-muted); border: 1px solid var(--border); }
     .q-badge.paused  { background: var(--accent-bg); color: var(--accent-hi); border: 1px solid rgba(124,58,237,.25); }
+
+    /* ── Labels ── */
+    .labels-section {
+      margin-top: 16px;
+      display: none;
+    }
+    .labels-section.visible { display: block; }
+    .labels-header {
+      display: flex; align-items: center; justify-content: space-between;
+      margin-bottom: 10px;
+    }
+    .labels-title {
+      font-size: 13px; font-weight: 600; color: var(--text-muted);
+      text-transform: uppercase; letter-spacing: .06em;
+    }
+    .btn-add-label {
+      background: var(--accent-bg);
+      border: 1px solid rgba(124,58,237,.3);
+      color: var(--accent-hi);
+      border-radius: var(--radius-sm);
+      padding: 4px 12px;
+      font-size: 12px; font-weight: 600;
+      cursor: pointer;
+      transition: background .15s, border-color .15s;
+    }
+    .btn-add-label:hover {
+      background: rgba(124,58,237,.22);
+      border-color: var(--accent-hi);
+    }
+    .label-row {
+      display: flex; align-items: center; gap: 8px;
+      margin-bottom: 8px;
+    }
+    .label-row input {
+      flex: 1;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: var(--radius-sm);
+      padding: 8px 12px;
+      font-size: 13px;
+      outline: none;
+      transition: border-color .15s;
+    }
+    .label-row input:focus { border-color: var(--accent); }
+    .label-row input::placeholder { color: var(--text-muted); }
+    .btn-remove-label {
+      background: transparent;
+      border: 1px solid var(--border);
+      color: var(--text-muted);
+      border-radius: var(--radius-sm);
+      width: 30px; height: 30px;
+      font-size: 14px;
+      cursor: pointer;
+      display: flex; align-items: center; justify-content: center;
+      flex-shrink: 0;
+      transition: background .15s, color .15s, border-color .15s;
+    }
+    .btn-remove-label:hover {
+      background: var(--red-bg);
+      color: var(--red);
+      border-color: rgba(248,81,73,.3);
+    }
+    .auto-label {
+      display: inline-flex; align-items: center; gap: 6px;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 20px; padding: 4px 12px;
+      font-size: 12px; color: var(--text-muted);
+      margin-bottom: 10px;
+    }
+    .auto-label .al-icon { color: var(--accent-hi); }
+
+    /* ── Label pills (in library) ── */
+    .label-pills {
+      display: flex; flex-wrap: wrap; gap: 4px;
+      margin-top: 4px;
+    }
+    .label-pill {
+      display: inline-block;
+      background: var(--accent-bg);
+      color: var(--accent-hi);
+      border: 1px solid rgba(124,58,237,.2);
+      border-radius: 12px; padding: 1px 8px;
+      font-size: 11px; font-weight: 500;
+    }
+    .label-pill.auto {
+      background: var(--surface2);
+      color: var(--text-muted);
+      border-color: var(--border);
+    }
+    .file-info { flex: 1; min-width: 0; }
+    .file-info .file-name {
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+    .btn-edit-labels {
+      flex-shrink: 0;
+      background: transparent;
+      border: 1px solid var(--border);
+      color: var(--text-muted);
+      border-radius: var(--radius-sm);
+      padding: 5px 10px;
+      font-size: 12px;
+      cursor: pointer;
+      transition: background .15s, color .15s, border-color .15s;
+    }
+    .btn-edit-labels:hover {
+      background: var(--accent-bg);
+      color: var(--accent-hi);
+      border-color: rgba(124,58,237,.3);
+    }
+
+    /* ── Modal ── */
+    .modal-overlay {
+      display: none;
+      position: fixed; inset: 0;
+      background: rgba(0,0,0,.6);
+      z-index: 50;
+      align-items: center; justify-content: center;
+    }
+    .modal-overlay.visible { display: flex; }
+    .modal {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 24px;
+      width: 90%; max-width: 500px;
+      max-height: 80vh; overflow-y: auto;
+    }
+    .modal-title {
+      font-size: 16px; font-weight: 600;
+      margin-bottom: 16px;
+    }
+    .modal-footer {
+      display: flex; gap: 10px; justify-content: flex-end;
+      margin-top: 16px;
+    }
+    .modal-btn {
+      padding: 8px 18px;
+      border-radius: var(--radius-sm);
+      font-size: 13px; font-weight: 600;
+      cursor: pointer; border: none;
+    }
+    .modal-btn.primary {
+      background: linear-gradient(135deg, var(--accent), #4f46e5);
+      color: #fff;
+    }
+    .modal-btn.secondary {
+      background: var(--surface2);
+      color: var(--text-muted);
+      border: 1px solid var(--border);
+    }
+    .modal-btn:hover { opacity: .85; }
   </style>
 </head>
 <body>
@@ -625,6 +871,20 @@ def ui():
         <div class="drop-label">Drop a PDF here or click to browse</div>
         <div class="drop-sub">Only PDF files · any size</div>
         <div id="selectedFile"></div>
+      </div>
+
+      <!-- Labels section (appears after file selected) -->
+      <div id="labelsSection" class="labels-section">
+        <div class="labels-header">
+          <div class="labels-title">Labels</div>
+          <button class="btn-add-label" onclick="addLabelRow()">+ Add Label</button>
+        </div>
+        <div class="auto-label" id="autoLabel" style="display:none">
+          <span class="al-icon">🏷</span>
+          <span id="autoLabelText">filename.pdf</span>
+          <span style="color:var(--text-muted); font-style:italic">(auto)</span>
+        </div>
+        <div id="labelRows"></div>
       </div>
 
       <button id="uploadBtn" disabled onclick="uploadFile()">
@@ -673,7 +933,115 @@ def ui():
 <!-- Toast -->
 <div id="toast"></div>
 
+<!-- Edit Labels Modal -->
+<div class="modal-overlay" id="editLabelsModal">
+  <div class="modal">
+    <div class="modal-title" id="editLabelsTitle">Edit Labels</div>
+    <div class="auto-label">
+      <span class="al-icon">🏷</span>
+      <span id="modalAutoLabel">filename.pdf</span>
+      <span style="color:var(--text-muted); font-style:italic">(auto)</span>
+    </div>
+    <div id="modalLabelRows"></div>
+    <button class="btn-add-label" onclick="addModalLabelRow()" style="margin-top:8px">+ Add Label</button>
+    <div class="modal-footer">
+      <button class="modal-btn secondary" onclick="closeEditLabels()">Cancel</button>
+      <button class="modal-btn primary" onclick="saveEditLabels()">Save Labels</button>
+    </div>
+  </div>
+</div>
+
 <script>
+  // ── Label rows (upload form) ──────────────────────────────────────
+  function addLabelRow(value = '') {
+    const container = document.getElementById('labelRows');
+    const row = document.createElement('div');
+    row.className = 'label-row';
+    row.innerHTML = `
+      <input type="text" placeholder="e.g. project name, category, topic…" value="${value.replace(/"/g, '&quot;')}" />
+      <button class="btn-remove-label" onclick="this.parentElement.remove()" title="Remove label">✕</button>
+    `;
+    container.appendChild(row);
+    row.querySelector('input').focus();
+  }
+
+  function getUploadLabels() {
+    const inputs = document.querySelectorAll('#labelRows .label-row input');
+    const labels = [];
+    inputs.forEach(inp => {
+      const v = inp.value.trim();
+      if (v) labels.push(v);
+    });
+    return labels;
+  }
+
+  // ── Modal label rows (edit existing labels) ───────────────────────
+  let editingFilename = null;
+
+  function addModalLabelRow(value = '') {
+    const container = document.getElementById('modalLabelRows');
+    const row = document.createElement('div');
+    row.className = 'label-row';
+    row.innerHTML = `
+      <input type="text" placeholder="e.g. project name, category, topic…" value="${value.replace(/"/g, '&quot;')}" />
+      <button class="btn-remove-label" onclick="this.parentElement.remove()" title="Remove label">✕</button>
+    `;
+    container.appendChild(row);
+    row.querySelector('input').focus();
+  }
+
+  async function openEditLabels(filename) {
+    editingFilename = filename;
+    document.getElementById('editLabelsTitle').textContent = `Edit Labels — ${filename}`;
+    document.getElementById('modalAutoLabel').textContent = filename;
+    document.getElementById('modalLabelRows').innerHTML = '';
+    // Load existing labels
+    try {
+      const r = await fetch('/labels/' + encodeURIComponent(filename));
+      const labels = await r.json();
+      if (labels.length) {
+        labels.forEach(l => addModalLabelRow(l));
+      } else {
+        addModalLabelRow();
+      }
+    } catch (_) {
+      addModalLabelRow();
+    }
+    document.getElementById('editLabelsModal').classList.add('visible');
+  }
+
+  function closeEditLabels() {
+    document.getElementById('editLabelsModal').classList.remove('visible');
+    editingFilename = null;
+  }
+
+  async function saveEditLabels() {
+    if (!editingFilename) return;
+    const inputs = document.querySelectorAll('#modalLabelRows .label-row input');
+    const labels = [];
+    inputs.forEach(inp => {
+      const v = inp.value.trim();
+      if (v) labels.push(v);
+    });
+    try {
+      await fetch('/labels/' + encodeURIComponent(editingFilename), {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ labels }),
+      });
+      toast(`Labels updated for ${editingFilename}`, 'ok');
+    } catch (e) {
+      toast(`Failed to save labels: ${e}`, 'err');
+    }
+    closeEditLabels();
+    refresh();
+  }
+
+  // Close modal on overlay click
+  document.getElementById('editLabelsModal').addEventListener('click', e => {
+    if (e.target === e.currentTarget) closeEditLabels();
+  });
+
   // ── Drag-and-drop ──────────────────────────────────────────────────
   const dz = document.getElementById('dropzone');
   const fi = document.getElementById('fileInput');
@@ -696,6 +1064,14 @@ def ui():
     const btn = document.getElementById('uploadBtn');
     btn.disabled = false;
     document.getElementById('uploadBtnLabel').textContent = `Upload & Index  "${f.name}"`;
+    // Show labels section + auto-label
+    document.getElementById('labelsSection').classList.add('visible');
+    document.getElementById('autoLabel').style.display = '';
+    document.getElementById('autoLabelText').textContent = f.name;
+    // Add one empty label row if none exist
+    if (document.getElementById('labelRows').children.length === 0) {
+      addLabelRow();
+    }
   }
 
   // ── Upload ─────────────────────────────────────────────────────────
@@ -707,17 +1083,27 @@ def ui():
     document.getElementById('uploadBtnLabel').textContent = 'Uploading…';
     document.getElementById('uploadBtnIcon').textContent = '⏳';
 
+    const labels = getUploadLabels();
     const form = new FormData();
     form.append('file', f);
+    if (labels.length) {
+      form.append('labels', JSON.stringify(labels));
+    }
     try {
       const r = await fetch('/upload', { method: 'POST', body: form });
       const d = await r.json();
       if (r.ok) {
-        toast(`✓ ${d.filename} uploaded — indexing started`, 'ok');
+        const lblCount = labels.length;
+        const lblMsg = lblCount ? ` with ${lblCount} label${lblCount > 1 ? 's' : ''}` : '';
+        toast(`✓ ${d.filename} uploaded${lblMsg} — indexing started`, 'ok');
         fi.value = '';
         document.getElementById('selectedFile').textContent = '';
         document.getElementById('uploadBtnLabel').textContent = 'Select a file first';
         document.getElementById('uploadBtnIcon').textContent = '⬆';
+        // Reset labels section
+        document.getElementById('labelsSection').classList.remove('visible');
+        document.getElementById('labelRows').innerHTML = '';
+        document.getElementById('autoLabel').style.display = 'none';
         // Show queued state immediately — don't wait for next poll
         showQueued(d.filename);
       } else {
@@ -823,6 +1209,15 @@ def ui():
   }
 
   // ── Status poll ────────────────────────────────────────────────────
+  let cachedLabels = {};
+
+  async function refreshLabels() {
+    try {
+      const r = await fetch('/labels');
+      cachedLabels = await r.json();
+    } catch (_) {}
+  }
+
   async function refreshStatus() {
     try {
       const r = await fetch('/status');
@@ -884,7 +1279,7 @@ def ui():
         iw.style.display = '';
       }
 
-      // File list
+      // File list with labels
       const ul = document.getElementById('fileList');
       const empty = document.getElementById('emptyState');
       ul.innerHTML = '';
@@ -896,10 +1291,20 @@ def ui():
           const esc = fn.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
           const li = document.createElement('li');
           li.dataset.file = fn;
+          // Build label pills
+          const fileLabels = cachedLabels[fn] || [];
+          let pillsHtml = `<span class="label-pill auto">📄 ${fn}</span>`;
+          fileLabels.forEach(l => {
+            pillsHtml += `<span class="label-pill">${l.replace(/</g,'&lt;')}</span>`;
+          });
           li.innerHTML = `
             <div class="file-icon">📄</div>
-            <div class="file-name" title="${fn}">${fn}</div>
+            <div class="file-info">
+              <div class="file-name" title="${fn}">${fn}</div>
+              <div class="label-pills">${pillsHtml}</div>
+            </div>
             <span class="file-badge">indexed</span>
+            <button class="btn-edit-labels" onclick="openEditLabels('${esc}')" title="Edit labels">🏷 Labels</button>
             <button class="btn-del" onclick="deletePdf('${esc}')">Remove</button>
           `;
           ul.appendChild(li);
@@ -921,7 +1326,7 @@ def ui():
     toastTimer = setTimeout(() => { el.className = ''; }, 3500);
   }
 
-  function refresh() { refreshStatus(); refreshQueue(); }
+  function refresh() { refreshLabels().then(() => refreshStatus()); refreshQueue(); }
   refresh();
   setInterval(refresh, 3000);
 </script>

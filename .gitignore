@@ -4,3 +4,4 @@ __pycache__/
 pipelines/cache/
 pipelines/colpali-pipeline/valves.json
 pipelines/pipeline_state.json
+pipelines/labels.json
