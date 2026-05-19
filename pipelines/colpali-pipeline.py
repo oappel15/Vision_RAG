@@ -461,7 +461,7 @@ class Pipeline:
             lines.append("### Custom Labels")
             for lbl in sorted(user_labels.keys(), key=str.lower):
                 files = user_labels[lbl]
-                snippet = f'label:"{lbl}"' if " " in lbl or "/" in lbl else f"label:{lbl}"
+                snippet = f'/label:"{lbl}"' if " " in lbl or "/" in lbl else f"/label:{lbl}"
                 count = len(files)
                 lines.append(
                     f"  - `{snippet}` — {count} doc{'s' if count != 1 else ''}"
@@ -475,16 +475,16 @@ class Pipeline:
                 if lbl.lower().endswith(".pdf"):
                     continue
                 files = auto_labels[lbl]
-                snippet = f'label:"{lbl}"' if " " in lbl or "/" in lbl else f"label:{lbl}"
+                snippet = f'/label:"{lbl}"' if " " in lbl or "/" in lbl else f"/label:{lbl}"
                 lines.append(f"  - `{snippet}`")
             lines.append("")
 
         lines.append("---")
         lines.append(
             "**Examples:**\n"
-            "  - `label:toyota engine specs` — search Toyota docs only\n"
-            "  - `label:Confluence project overview` — Confluence pages only\n"
-            "  - `label:toyota label:Confluence meeting notes` — both labels must match"
+            "  - `/label:toyota engine specs` — search Toyota docs only\n"
+            "  - `/label:Confluence project overview` — Confluence pages only\n"
+            "  - `/label:toyota /label:Confluence meeting notes` — both labels must match"
         )
 
         return "\n".join(lines)
@@ -779,18 +779,19 @@ class Pipeline:
     def _parse_label_filters(query: str) -> tuple:
         """Parse label filter prefixes from query.
 
-        Supports:
-          - labels:value       (single label, no spaces)
-          - labels:"my value"  (quoted, with spaces)
-          - Multiple labels: can repeat prefix
+        Supports (with or without leading /):
+          - label:value          /label:value
+          - label:"my value"     /label:"my value"
+          - labels:value         /labels:value
+          - Multiple: can repeat prefix
 
         Returns (clean_query, label_list) where label_list may be empty.
         """
         label_filters = []
         clean = query
 
-        # Match labels:"quoted value" or labels:unquoted_value
-        pattern = r'labels?:"([^"]+)"|labels?:(\S+)'
+        # Match /label:"quoted" or /label:unquoted (leading / is optional)
+        pattern = r'/?labels?:"([^"]+)"|/?labels?:(\S+)'
         matches = re.findall(pattern, clean, re.IGNORECASE)
         for quoted, unquoted in matches:
             val = (quoted or unquoted).strip()
@@ -798,8 +799,8 @@ class Pipeline:
                 label_filters.append(val)
 
         # Remove matched patterns from query
-        clean = re.sub(r'\s*labels?:"[^"]+"\s*', ' ', clean, flags=re.IGNORECASE)
-        clean = re.sub(r'\s*labels?:\S+\s*', ' ', clean, flags=re.IGNORECASE)
+        clean = re.sub(r'\s*/?labels?:"[^"]+"\s*', ' ', clean, flags=re.IGNORECASE)
+        clean = re.sub(r'\s*/?labels?:\S+\s*', ' ', clean, flags=re.IGNORECASE)
         clean = clean.strip()
 
         return clean, label_filters
