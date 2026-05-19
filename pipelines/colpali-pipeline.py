@@ -214,11 +214,32 @@ class Pipeline:
             os.remove(thumb_path)
         return img_filename
 
-    def _load_page_image_b64(self, img_filename: str) -> str:
-        """Load cached image as base64 for VLM."""
+    def _load_page_image_b64(self, img_filename: str, max_dim: int = 8000) -> str:
+        """Load cached image as base64 for VLM.
+
+        If either dimension exceeds max_dim, the image is downscaled
+        proportionally so it fits within the limit. This prevents
+        oversized images (e.g. wide engineering drawings) from causing
+        silent failures on VLMs with strict dimension limits (GPT, Claude).
+        The original cached file is untouched.
+        """
         img_path = os.path.join(self.valves.IMAGE_CACHE_DIR, img_filename)
-        with open(img_path, "rb") as f:
-            return base64.b64encode(f.read()).decode("utf-8")
+        img = Image.open(img_path)
+        w, h = img.size
+        if w > max_dim or h > max_dim:
+            scale = min(max_dim / w, max_dim / h)
+            new_w, new_h = int(w * scale), int(h * scale)
+            log.info(
+                f"Resizing {img_filename} for VLM: {w}x{h} → {new_w}x{new_h} "
+                f"(max_dim={max_dim})"
+            )
+            img = img.resize((new_w, new_h), Image.LANCZOS)
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=self.valves.INDEXING_JPEG_QUALITY)
+            return base64.b64encode(buf.getvalue()).decode("utf-8")
+        else:
+            with open(img_path, "rb") as f:
+                return base64.b64encode(f.read()).decode("utf-8")
 
     def _make_thumbnail_file(self, img_filename: str, max_width: int = 150) -> str:
         """Create/cache thumbnail, return thumbnail filename."""
