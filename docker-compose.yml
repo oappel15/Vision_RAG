@@ -95,6 +95,7 @@ services:
       - PDF_DIR=/app/downloads
       - STATE_DIR=/app/state
       - PIPELINE_STATE_FILE=/app/pipelines/pipeline_state.json
+      - LABELS_FILE=/app/pipelines/labels.json
     volumes:
       - ./my-pdfs:/app/downloads
       - ./pipelines:/app/pipelines

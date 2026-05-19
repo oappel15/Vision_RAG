@@ -53,6 +53,7 @@ CONFLUENCE_RENDER_URL = f"http://localhost:{CONFLUENCE_PORT}"
 PDF_DIR = pathlib.Path(os.getenv("PDF_DIR", "/app/downloads"))
 STATE_DIR = pathlib.Path(os.getenv("STATE_DIR", "/app/state"))
 PIPELINE_STATE_FILE = pathlib.Path(os.getenv("PIPELINE_STATE_FILE", "/app/pipelines/pipeline_state.json"))
+LABELS_FILE = pathlib.Path(os.getenv("LABELS_FILE", "/app/pipelines/labels.json"))
 WATCHER_STATE_FILE = STATE_DIR / "watcher_state.json"
 
 PDF_DIR.mkdir(parents=True, exist_ok=True)
@@ -145,6 +146,41 @@ def update_watcher_state(state: dict, space_key: str, page_id: str,
     }
     _save_watcher_state(state)
     log.info(f"State updated: {space_key}/{page_id} v{version} → {pdf_filename}")
+
+
+# ── Labels helpers ────────────────────────────────────────────────────────────
+def _load_labels() -> dict:
+    if LABELS_FILE.exists():
+        try:
+            with open(LABELS_FILE) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+
+def _save_labels(labels: dict) -> None:
+    tmp = str(LABELS_FILE) + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(labels, f, indent=2)
+    os.replace(tmp, str(LABELS_FILE))
+
+
+def set_confluence_labels(pdf_filename: str, page_title: str, space_key: str) -> None:
+    """Auto-label a Confluence-rendered PDF with the page title and 'Confluence'."""
+    all_labels = _load_labels()
+    labels = ["Confluence", f"Confluence/{space_key}", page_title]
+    # Deduplicate case-insensitively, preserve order
+    seen = set()
+    deduped = []
+    for lbl in labels:
+        lower = lbl.lower()
+        if lower not in seen:
+            seen.add(lower)
+            deduped.append(lbl)
+    all_labels[pdf_filename] = deduped
+    _save_labels(all_labels)
+    log.info(f"Labels set for {pdf_filename}: {deduped}")
 
 
 # ── Confluence API ────────────────────────────────────────────────────────────
@@ -334,6 +370,13 @@ def handle_deleted_pages(watcher_state: dict, space_key: str, live_page_ids: set
 
         delete_from_qdrant(pdf_filename)
         patch_pipeline_state(pdf_filename)
+
+        # Clean up labels
+        all_labels = _load_labels()
+        if pdf_filename in all_labels:
+            del all_labels[pdf_filename]
+            _save_labels(all_labels)
+
         del watcher_state[space_key][page_id]
 
     if deleted_ids:
@@ -387,6 +430,7 @@ def process_space(space_key: str, watcher_state: dict) -> None:
             log.error(f"Failed to render page {page_id}: {e}")
             continue
 
+        set_confluence_labels(new_filename, title, space_key)
         update_watcher_state(watcher_state, space_key, page_id, version, title, new_filename)
         needs_reindex = True
 
