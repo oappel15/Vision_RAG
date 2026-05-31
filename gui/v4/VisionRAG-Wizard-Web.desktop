@@ -1,0 +1,7 @@
+[Desktop Entry]
+Name=Vision RAG Wizard (Web)
+Comment=Vision RAG Migration Wizard — Web UI
+Exec=bash -c "cd /mnt/f/VisionRAG_Update/gui/v4 && python3 vision_rag_web.py & sleep 3 && xdg-open http://localhost:5555"
+Terminal=true
+Type=Application
+Categories=System;
