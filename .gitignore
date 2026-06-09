@@ -1,0 +1,9 @@
+.env
+__pycache__/
+*.pyc
+pipelines/cache/
+pipelines/colpali-pipeline/valves.json
+pipelines/pipeline_state.json
+pipelines/labels.json
+vision-rag-backups/
+nul

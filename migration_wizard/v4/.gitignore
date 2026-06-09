@@ -1,0 +1,5 @@
+nul
+.ruff_cache/
+test-chrome.bat
+chrome-test-log.txt
+log.txt

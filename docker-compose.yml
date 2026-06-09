@@ -1,0 +1,133 @@
+services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    volumes:
+      - ollama:/root/.ollama
+    ports:
+      - "11434:11434"
+    restart: unless-stopped
+
+  pipelines:
+    build: ./pipelines
+    image: vision-rag-pipelines:latest
+    # image: ghcr.io/open-webui/pipelines:main
+    container_name: open-webui-pipelines
+    ports:
+      - "9099:9099"
+    environment:
+      - PIPELINES_API_KEY=0p3n-w3bu!
+      - PIPELINES_REQUIREMENTS_PATH=/app/pipelines/requirements.txt
+      - OLLAMA_BASE_URL=http://ollama:11434
+      - QDRANT_URL=http://qdrant:6333
+      - VLM_MODEL=moondream:latest
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
+      - OPENROUTER_MODEL=qwen/qwen3-vl-30b-a3b-instruct
+      - TARGET_KNOWLEDGE=my_docs
+      - PYTHONUNBUFFERED=1
+      - SERVER_HOST=${HOST_IP:-localhost}
+    volumes:
+      - ./pipelines:/app/pipelines
+      - ./my-pdfs:/app/downloads
+      - hf-cache:/root/.cache/huggingface
+
+    depends_on:
+      - ollama
+      - qdrant
+    restart: unless-stopped
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: qdrant
+    ports:
+      - "6333:6333"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    restart: unless-stopped
+
+  image-server:
+    image: python:3.11-alpine
+    command: python -m http.server 80 -d /data --bind 0.0.0.0
+    volumes:
+      - ./pipelines/cache/images:/data:ro
+    ports:
+      - "0.0.0.0:8081:80"
+    restart: unless-stopped
+
+  pdf-ingest:
+    build: ./pdf-ingest
+    image: vision-rag-pdf-ingest:latest
+    container_name: pdf-ingest
+    ports:
+      - "0.0.0.0:8082:8082"
+    environment:
+      - PDF_DIR=/app/downloads
+      - STATE_FILE=/app/pipelines/pipeline_state.json
+      - LABELS_FILE=/app/pipelines/labels.json
+      - WATCHER_STATE_FILE=/app/watcher_state/watcher_state.json
+      - PIPELINES_URL=http://pipelines:9099
+      - PIPELINES_API_KEY=0p3n-w3bu!
+      - PIPELINE_MODEL=colpali-pipeline
+      - QDRANT_HOST=qdrant
+      - QDRANT_PORT=6333
+      - COLLECTION_NAME=my_docs
+    volumes:
+      - ./my-pdfs:/app/downloads
+      - ./pipelines:/app/pipelines
+      - ./confluence-watcher:/app/watcher_state
+    depends_on:
+      - pipelines
+      - qdrant
+    restart: unless-stopped
+
+  confluence-watcher:
+    build: ./confluence-watcher
+    image: vision-rag-confluence-watcher:latest
+    container_name: confluence-watcher
+    environment:
+      - CONFLUENCE_URL=${CONFLUENCE_URL:-http://host.docker.internal:8090}
+      - CONFLUENCE_PAT=${CONFLUENCE_PAT}
+      - CONFLUENCE_SPACES=${CONFLUENCE_SPACES:-RAG}
+      - QDRANT_HOST=qdrant
+      - QDRANT_PORT=6333
+      - COLLECTION_NAME=my_docs
+      - PIPELINES_URL=http://pipelines:9099
+      - PIPELINES_API_KEY=0p3n-w3bu!
+      - PIPELINE_MODEL=colpali-pipeline
+      - POLL_INTERVAL=${CONFLUENCE_POLL_INTERVAL:-300}
+      - PDF_DIR=/app/downloads
+      - STATE_DIR=/app/state
+      - PIPELINE_STATE_FILE=/app/pipelines/pipeline_state.json
+      - LABELS_FILE=/app/pipelines/labels.json
+    volumes:
+      - ./my-pdfs:/app/downloads
+      - ./pipelines:/app/pipelines
+      - ./confluence-watcher:/app/state
+    depends_on:
+      - qdrant
+      - pipelines
+    restart: unless-stopped
+
+  open-webui:
+    build: .
+    image: vision-rag-open-webui:latest
+    container_name: open-webui
+    volumes:
+      - open-webui:/app/backend/data
+    depends_on:
+      - ollama
+      - pipelines
+    ports:
+      - "0.0.0.0:3000:8080"
+    environment:
+      - HOST=0.0.0.0
+      - OLLAMA_BASE_URL=http://ollama:11434
+      - PIPELINES_BASE_URL=http://pipelines:9099
+      - PIPELINES_API_KEY=0p3n-w3bu!
+    restart: unless-stopped
+
+volumes:
+  ollama:
+  open-webui:
+  qdrant_data:
+  hf-cache:
