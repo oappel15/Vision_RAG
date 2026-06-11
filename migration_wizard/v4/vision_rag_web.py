@@ -1335,13 +1335,14 @@ def tgt_import_sudo(password):
         except PermissionError as e:
             log_emit(
                 "target",
-                f"  ⚠ Permission denied: {item.name}, forcing removal with sudo...",
+                f"  ⚠ Permission denied: {item.name} ({e}), forcing removal with sudo...",
                 "WARN",
             )
             try:
+                _r = None
                 if shutil.which("wsl"):
                     _wp = win2wsl(str(di)) or str(di)
-                    subprocess.run(
+                    _r = subprocess.run(
                         [
                             "wsl",
                             "-e",
@@ -1354,7 +1355,7 @@ def tgt_import_sudo(password):
                         timeout=30,
                     )
                 else:
-                    subprocess.run(
+                    _r = subprocess.run(
                         ["bash", "-c", f"echo '{password}' | sudo -S rm -rf '{di}'"],
                         capture_output=True,
                         text=True,
@@ -1366,7 +1367,48 @@ def tgt_import_sudo(password):
                         "target", f"  ✓ {item.name} (fixed with sudo rm + copy)", "OK"
                     )
                 else:
-                    log_emit("target", f"  ✗ Could not remove {item.name}", "ERROR")
+                    _detail = ""
+                    if _r:
+                        _detail = f" (rc={_r.returncode}"
+                        if _r.stderr:
+                            _detail += f", stderr={_r.stderr.strip()}"
+                        _detail += ")"
+                    log_emit(
+                        "target",
+                        f"  ✗ Could not remove {item.name}{_detail}, trying file-by-file copy...",
+                        "WARN",
+                    )
+                    _fb_ok = 0
+                    _fb_fail = 0
+                    for src_f in item.rglob("*"):
+                        if not src_f.is_file():
+                            continue
+                        rel = src_f.relative_to(item)
+                        tgt_f = di / rel
+                        try:
+                            tgt_f.parent.mkdir(parents=True, exist_ok=True)
+                            with open(src_f, "rb") as fi, open(tgt_f, "wb") as fo:
+                                fo.write(fi.read())
+                            _fb_ok += 1
+                        except Exception as fe:
+                            log_emit(
+                                "target",
+                                f"  ⚠ {rel}: {fe}",
+                                "WARN",
+                            )
+                            _fb_fail += 1
+                    if _fb_fail == 0:
+                        log_emit(
+                            "target",
+                            f"  ✓ {item.name} ({_fb_ok} files copied file-by-file)",
+                            "OK",
+                        )
+                    else:
+                        log_emit(
+                            "target",
+                            f"  ⚠ {item.name} ({_fb_ok} ok, {_fb_fail} failed)",
+                            "WARN",
+                        )
             except Exception as e2:
                 log_emit("target", f"  ✗ Failed to copy {item.name}: {e2}", "ERROR")
             continue
