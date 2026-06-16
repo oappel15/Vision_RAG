@@ -34,7 +34,9 @@ log = logging.getLogger(__name__)
 # ── Configuration ────────────────────────────────────────────────────────────
 CONFLUENCE_URL = os.getenv("CONFLUENCE_URL", "http://localhost:8090")
 CONFLUENCE_PAT = os.getenv("CONFLUENCE_PAT", "")
-CONFLUENCE_SPACES = [s.strip() for s in os.getenv("CONFLUENCE_SPACES", "RAG").split(",") if s.strip()]
+CONFLUENCE_SPACES = [
+    s.strip() for s in os.getenv("CONFLUENCE_SPACES", "RAG").split(",") if s.strip()
+]
 QDRANT_HOST = os.getenv("QDRANT_HOST", "qdrant")
 QDRANT_PORT = int(os.getenv("QDRANT_PORT", "6333"))
 COLLECTION_NAME = os.getenv("COLLECTION_NAME", "my_docs")
@@ -42,6 +44,10 @@ PIPELINES_URL = os.getenv("PIPELINES_URL", "http://pipelines:9099")
 PIPELINES_API_KEY = os.getenv("PIPELINES_API_KEY", "0p3n-w3bu!")
 PIPELINE_MODEL = os.getenv("PIPELINE_MODEL", "colpali-pipeline")
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "300"))
+PDF_DIR = pathlib.Path(os.getenv("PDF_DIR", "/app/downloads"))
+IMAGE_CACHE_DIR = pathlib.Path(
+    os.getenv("IMAGE_CACHE_DIR", "/app/pipelines/cache/images")
+)
 
 # Derive a localhost-based render URL so Playwright navigates to localhost:PORT,
 # matching Confluence's configured base URL and avoiding the "URL doesn't match" warning.
@@ -50,14 +56,32 @@ _parsed_url = urlparse(CONFLUENCE_URL)
 CONFLUENCE_PORT = _parsed_url.port or 8090
 CONFLUENCE_RENDER_URL = f"http://localhost:{CONFLUENCE_PORT}"
 
-PDF_DIR = pathlib.Path(os.getenv("PDF_DIR", "/app/downloads"))
 STATE_DIR = pathlib.Path(os.getenv("STATE_DIR", "/app/state"))
-PIPELINE_STATE_FILE = pathlib.Path(os.getenv("PIPELINE_STATE_FILE", "/app/pipelines/pipeline_state.json"))
+PIPELINE_STATE_FILE = pathlib.Path(
+    os.getenv("PIPELINE_STATE_FILE", "/app/pipelines/pipeline_state.json")
+)
 LABELS_FILE = pathlib.Path(os.getenv("LABELS_FILE", "/app/pipelines/labels.json"))
 WATCHER_STATE_FILE = STATE_DIR / "watcher_state.json"
 
 PDF_DIR.mkdir(parents=True, exist_ok=True)
 STATE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _cleanup_cached_images(filename: str) -> int:
+    """Remove cached page images and thumbnails for a given PDF filename.
+    Returns the number of files removed."""
+    if not IMAGE_CACHE_DIR.exists():
+        return 0
+    stem = pathlib.Path(filename).stem
+    removed = 0
+    for pattern in (f"{stem}_p*.jpg", f"{stem}_p*_thumb.jpg"):
+        for f in IMAGE_CACHE_DIR.glob(pattern):
+            f.unlink()
+            removed += 1
+    if removed:
+        log.info(f"Cleaned up {removed} cached image(s) for {filename}")
+    return removed
+
 
 # ── Auth headers ─────────────────────────────────────────────────────────────
 def _auth_headers() -> dict:
@@ -70,17 +94,18 @@ def _auth_headers() -> dict:
 # ── Slug / filename helpers ───────────────────────────────────────────────────
 def slugify(text: str, max_len: int = 35) -> str:
     """Convert a page title to a lowercase, filename-safe slug."""
-    s = re.sub(r"[—–\-]", " ", text)       # dashes → space
-    s = re.sub(r"[^\w\s]", "", s)           # drop punctuation
-    s = re.sub(r"\s+", "_", s.strip())      # spaces → underscore
+    s = re.sub(r"[—–\-]", " ", text)  # dashes → space
+    s = re.sub(r"[^\w\s]", "", s)  # drop punctuation
+    s = re.sub(r"\s+", "_", s.strip())  # spaces → underscore
     s = s.lower()
-    s = re.sub(r"_+", "_", s).strip("_")   # collapse underscores
+    s = re.sub(r"_+", "_", s).strip("_")  # collapse underscores
     if len(s) > max_len:
         s = s[:max_len].rstrip("_")
     return s
 
 
 _homepage_cache: dict[str, str] = {}
+
 
 def get_space_homepage_id(space_key: str) -> str:
     """Fetch and cache the space homepage ID (used to exclude it from paths)."""
@@ -95,8 +120,9 @@ def get_space_homepage_id(space_key: str) -> str:
     return homepage_id
 
 
-def build_pdf_filename(space_key: str, page_id: str, title: str,
-                       ancestors: list, homepage_id: str) -> str:
+def build_pdf_filename(
+    space_key: str, page_id: str, title: str, ancestors: list, homepage_id: str
+) -> str:
     """
     Build a hierarchical, human-readable PDF path.
 
@@ -134,8 +160,14 @@ def _save_watcher_state(state: dict) -> None:
     os.replace(tmp, str(WATCHER_STATE_FILE))
 
 
-def update_watcher_state(state: dict, space_key: str, page_id: str,
-                         version: int, title: str, pdf_filename: str) -> None:
+def update_watcher_state(
+    state: dict,
+    space_key: str,
+    page_id: str,
+    version: int,
+    title: str,
+    pdf_filename: str,
+) -> None:
     if space_key not in state:
         state[space_key] = {}
     state[space_key][page_id] = {
@@ -205,13 +237,15 @@ def poll_confluence(space_key: str) -> list[dict]:
         data = resp.json()
         results = data.get("results", [])
         for page in results:
-            pages.append({
-                "id": str(page["id"]),
-                "title": page["title"],
-                "version": page["version"]["number"],
-                "space_key": space_key,
-                "ancestors": page.get("ancestors", []),
-            })
+            pages.append(
+                {
+                    "id": str(page["id"]),
+                    "title": page["title"],
+                    "version": page["version"]["number"],
+                    "space_key": space_key,
+                    "ancestors": page.get("ancestors", []),
+                }
+            )
 
         size = data.get("size", 0)
         start += size
@@ -222,7 +256,9 @@ def poll_confluence(space_key: str) -> list[dict]:
     return pages
 
 
-def has_changed(watcher_state: dict, space_key: str, page_id: str, version: int) -> bool:
+def has_changed(
+    watcher_state: dict, space_key: str, page_id: str, version: int
+) -> bool:
     stored = watcher_state.get(space_key, {}).get(page_id)
     if stored is None:
         return True
@@ -230,7 +266,9 @@ def has_changed(watcher_state: dict, space_key: str, page_id: str, version: int)
         return True
     # Re-render if the PDF was deleted externally (e.g. via pdf-ingest UI)
     if not (PDF_DIR / stored["pdf_filename"]).exists():
-        log.info(f"PDF missing for {page_id} ({stored['pdf_filename']}) — will re-render")
+        log.info(
+            f"PDF missing for {page_id} ({stored['pdf_filename']}) — will re-render"
+        )
         return True
     return False
 
@@ -262,13 +300,17 @@ def render_page_to_pdf(page_id: str, pdf_path: pathlib.Path) -> None:
     host_ip = _resolve_docker_host_ip()
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(args=[
-            "--no-sandbox",
-            "--disable-dev-shm-usage",
-            f"--host-resolver-rules=MAP localhost {host_ip}",
-        ])
+        browser = p.chromium.launch(
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                f"--host-resolver-rules=MAP localhost {host_ip}",
+            ]
+        )
         ctx = browser.new_context(
-            extra_http_headers={"Authorization": f"Bearer {CONFLUENCE_PAT}"} if CONFLUENCE_PAT else {}
+            extra_http_headers={"Authorization": f"Bearer {CONFLUENCE_PAT}"}
+            if CONFLUENCE_PAT
+            else {}
         )
         pg = ctx.new_page()
         try:
@@ -292,7 +334,11 @@ def delete_from_qdrant(pdf_filename: str) -> None:
             collection_name=COLLECTION_NAME,
             points_selector=FilterSelector(
                 filter=Filter(
-                    must=[FieldCondition(key="source", match=MatchValue(value=pdf_filename))]
+                    must=[
+                        FieldCondition(
+                            key="source", match=MatchValue(value=pdf_filename)
+                        )
+                    ]
                 )
             ),
         )
@@ -310,10 +356,14 @@ def patch_pipeline_state(filename: str) -> None:
             state = json.load(f)
         changed = False
         if filename in state.get("indexed_files", []):
-            state["indexed_files"] = [f for f in state["indexed_files"] if f != filename]
+            state["indexed_files"] = [
+                f for f in state["indexed_files"] if f != filename
+            ]
             changed = True
         if filename in state.get("skipped_files", []):
-            state["skipped_files"] = [f for f in state["skipped_files"] if f != filename]
+            state["skipped_files"] = [
+                f for f in state["skipped_files"] if f != filename
+            ]
             changed = True
         if filename in state.get("file_progress", {}):
             del state["file_progress"][filename]
@@ -349,14 +399,18 @@ def trigger_reindex() -> None:
 
 
 # ── Deletion detection ────────────────────────────────────────────────────────
-def handle_deleted_pages(watcher_state: dict, space_key: str, live_page_ids: set[str]) -> None:
+def handle_deleted_pages(
+    watcher_state: dict, space_key: str, live_page_ids: set[str]
+) -> None:
     stored_ids = set(watcher_state.get(space_key, {}).keys())
     deleted_ids = stored_ids - live_page_ids
 
     for page_id in deleted_ids:
         entry = watcher_state[space_key][page_id]
         pdf_filename = entry["pdf_filename"]
-        log.info(f"Page {page_id} ({entry['title']!r}) deleted from Confluence — cleaning up")
+        log.info(
+            f"Page {page_id} ({entry['title']!r}) deleted from Confluence — cleaning up"
+        )
 
         pdf_path = PDF_DIR / pdf_filename
         if pdf_path.exists():
@@ -370,6 +424,7 @@ def handle_deleted_pages(watcher_state: dict, space_key: str, live_page_ids: set
 
         delete_from_qdrant(pdf_filename)
         patch_pipeline_state(pdf_filename)
+        _cleanup_cached_images(pdf_filename)
 
         # Clean up labels
         all_labels = _load_labels()
@@ -402,7 +457,9 @@ def process_space(space_key: str, watcher_state: dict) -> None:
             continue
 
         action = "new" if page_id not in watcher_state.get(space_key, {}) else "updated"
-        new_filename = build_pdf_filename(space_key, page_id, title, ancestors, homepage_id)
+        new_filename = build_pdf_filename(
+            space_key, page_id, title, ancestors, homepage_id
+        )
         pdf_path = PDF_DIR / new_filename
 
         # Build a readable path label for logging  (e.g. SpaceX / Falcon 9)
@@ -431,7 +488,9 @@ def process_space(space_key: str, watcher_state: dict) -> None:
             continue
 
         set_confluence_labels(new_filename, title, space_key)
-        update_watcher_state(watcher_state, space_key, page_id, version, title, new_filename)
+        update_watcher_state(
+            watcher_state, space_key, page_id, version, title, new_filename
+        )
         needs_reindex = True
 
     if needs_reindex:
@@ -439,8 +498,12 @@ def process_space(space_key: str, watcher_state: dict) -> None:
 
 
 def main() -> None:
-    log.info(f"Confluence watcher starting — spaces={CONFLUENCE_SPACES}, interval={POLL_INTERVAL}s")
-    log.info(f"Confluence: {CONFLUENCE_URL}, Qdrant: {QDRANT_HOST}:{QDRANT_PORT}/{COLLECTION_NAME}")
+    log.info(
+        f"Confluence watcher starting — spaces={CONFLUENCE_SPACES}, interval={POLL_INTERVAL}s"
+    )
+    log.info(
+        f"Confluence: {CONFLUENCE_URL}, Qdrant: {QDRANT_HOST}:{QDRANT_PORT}/{COLLECTION_NAME}"
+    )
     log.info(f"PDF dir: {PDF_DIR}, Pipeline: {PIPELINES_URL}")
 
     while True:

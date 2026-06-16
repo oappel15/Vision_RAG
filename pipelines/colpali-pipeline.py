@@ -213,7 +213,9 @@ class Pipeline:
             os.remove(thumb_path)
         return img_filename
 
-    def _load_page_image_b64(self, img_filename: str, max_dim: int = 8000) -> str:
+    def _load_page_image_b64(
+        self, img_filename: str, max_dim: int = 8000
+    ) -> str | None:
         """Load cached image as base64 for VLM.
 
         If either dimension exceeds max_dim, the image is downscaled
@@ -221,8 +223,12 @@ class Pipeline:
         oversized images (e.g. wide engineering drawings) from causing
         silent failures on VLMs with strict dimension limits (GPT, Claude).
         The original cached file is untouched.
+        Returns None if the image file is missing from cache.
         """
         img_path = os.path.join(self.valves.IMAGE_CACHE_DIR, img_filename)
+        if not os.path.exists(img_path):
+            log.warning(f"Cached image missing: {img_path}")
+            return None
         img = Image.open(img_path)
         w, h = img.size
         if w > max_dim or h > max_dim:
@@ -240,11 +246,17 @@ class Pipeline:
             with open(img_path, "rb") as f:
                 return base64.b64encode(f.read()).decode("utf-8")
 
-    def _make_thumbnail_file(self, img_filename: str, max_width: int = 150) -> str:
-        """Create/cache thumbnail, return thumbnail filename."""
+    def _make_thumbnail_file(
+        self, img_filename: str, max_width: int = 150
+    ) -> str | None:
+        """Create/cache thumbnail, return thumbnail filename.
+        Returns None if the source image is missing from cache."""
         thumb_filename = img_filename.replace(".jpg", "_thumb.jpg")
         thumb_path = os.path.join(self.valves.IMAGE_CACHE_DIR, thumb_filename)
         src_path = os.path.join(self.valves.IMAGE_CACHE_DIR, img_filename)
+        if not os.path.exists(src_path):
+            log.warning(f"Cached image missing, cannot make thumbnail: {src_path}")
+            return None
         stale = not os.path.exists(thumb_path) or os.path.getmtime(
             src_path
         ) > os.path.getmtime(thumb_path)
@@ -632,6 +644,49 @@ class Pipeline:
                 )
                 log.info(f"After reconciliation: {len(to_index)} PDFs to index")
 
+        # ── Validate cached images ──────────────────────────────────
+        # Check that indexed files still have their page images on disk.
+        # If the cache was lost (e.g. git clone, Docker reset), force re-index
+        # so images are regenerated.
+        if indexed:
+            cache_missing_files = []
+            for filename in list(indexed):
+                pts, _ = self.qdrant.scroll(
+                    collection_name=collection,
+                    scroll_filter=Filter(
+                        must=[
+                            FieldCondition(
+                                key="source", match=MatchValue(value=filename)
+                            )
+                        ]
+                    ),
+                    limit=1,
+                    with_payload=True,
+                    with_vectors=False,
+                )
+                if pts:
+                    img_fn = pts[0].payload.get("image_filename", "")
+                    if img_fn:
+                        img_path = os.path.join(self.valves.IMAGE_CACHE_DIR, img_fn)
+                        if not os.path.exists(img_path):
+                            cache_missing_files.append(filename)
+            if cache_missing_files:
+                log.info(
+                    f"Cache validation: {len(cache_missing_files)} files missing "
+                    f"cached images → {cache_missing_files}. Forcing re-index."
+                )
+                state = self._load_state()
+                state["indexed_files"] = [
+                    f for f in state["indexed_files"] if f not in cache_missing_files
+                ]
+                self._save_state(state)
+                indexed -= set(cache_missing_files)
+                to_index = sorted(
+                    [p for p in pdfs if str(p.relative_to(pdf_dir)) not in indexed],
+                    key=_sort_key,
+                )
+                log.info(f"After cache validation: {len(to_index)} PDFs to index")
+
         for pdf_file in to_index:
             if self._cancel_flag.is_set():
                 log.info("Indexing cancelled — stopping before next file")
@@ -963,6 +1018,8 @@ class Pipeline:
             score = hit.score
             if img_filename:
                 thumb_filename = self._make_thumbnail_file(img_filename)
+                if thumb_filename is None:
+                    continue
                 img_base = f"http://{self.valves.SERVER_HOST}:8081"
                 full_url = f"{img_base}/{img_filename}"
                 thumb_path = os.path.join(self.valves.IMAGE_CACHE_DIR, thumb_filename)
@@ -1010,12 +1067,16 @@ class Pipeline:
             model = self.valves.OPENROUTER_MODEL
 
         content_parts = [{"type": "text", "text": query}]
+        missing_images = []
         for i, hit in enumerate(hits, 1):
             img_filename = hit.payload.get("image_filename", "")
             src = hit.payload.get("source", "?")
             pg = hit.payload.get("page_number", "?")
             if img_filename:
                 img_b64 = self._load_page_image_b64(img_filename)
+                if img_b64 is None:
+                    missing_images.append(f"{src} p{pg}")
+                    continue
                 content_parts.append(
                     {"type": "text", "text": f"[REF:{i}] Page {pg} from {src}"}
                 )
@@ -1025,6 +1086,22 @@ class Pipeline:
                         "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"},
                     }
                 )
+        if missing_images:
+            log.warning(
+                f"Skipping {len(missing_images)} pages with missing cache images: "
+                f"{missing_images}. Re-index to regenerate."
+            )
+            yield (
+                f"\n> ⚠️ **{len(missing_images)} page(s) skipped** — cached images "
+                f"missing. Re-index to regenerate: "
+                f"{', '.join(missing_images)}\n\n"
+            )
+        if len(content_parts) == 1:
+            yield (
+                "> ❌ No page images available for VLM — all cached images are missing.\n"
+                "> Trigger a re-index to regenerate the image cache, then retry your query.\n"
+            )
+            return
 
         # ── Reasoning policy per model family ──
         # Some models burn an enormous reasoning budget that consumes most

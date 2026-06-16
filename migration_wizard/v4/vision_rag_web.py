@@ -6,7 +6,7 @@ Flask + SSE backend with premium dark HTML/CSS/JS frontend.
 Self-contained: all logic in this single file. No .md or .sh files needed.
 """
 
-import os, sys, json, hashlib, shutil, subprocess, threading, time, re
+import os, sys, json, hashlib, shutil, subprocess, threading, time, re, tempfile
 from datetime import datetime
 from pathlib import Path
 
@@ -712,6 +712,18 @@ def src_code():
             return
         if src.parent.name == "cache" and src.parent.parent.name == "pipelines":
             return
+        if (
+            src.parent.name == "pipelines"
+            and src.is_file()
+            and src.name in ("pipeline_state.json", "labels.json")
+        ):
+            return
+        if (
+            src.parent.name == "colpali-pipeline"
+            and src.parent.parent.name == "pipelines"
+            and src.name == "valves.json"
+        ):
+            return
         try:
             if src.is_dir():
                 dst.mkdir(exist_ok=True)
@@ -1135,6 +1147,38 @@ def tgt_import():
         )
     else:
         log_emit("target", "✓ Ownership fixed", "OK")
+    # ── Preserve target-specific data before code copy ──────────
+    _PRESERVE_RELS = [
+        Path("pipelines/cache"),
+        Path("pipelines/pipeline_state.json"),
+        Path("pipelines/labels.json"),
+        Path("pipelines/colpali-pipeline/valves.json"),
+    ]
+    preserve_tmp = tempfile.TemporaryDirectory(prefix="vrag_preserve_")
+    preserve_dir = Path(preserve_tmp.name)
+    preserved_items = []
+    for rel in _PRESERVE_RELS:
+        target_path = tgt / rel
+        if target_path.exists():
+            tmp_path = preserve_dir / rel
+            tmp_path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                if target_path.is_dir():
+                    shutil.copytree(target_path, tmp_path)
+                    preserved_items.append(f"{rel}/ (dir)")
+                else:
+                    shutil.copy2(target_path, tmp_path)
+                    preserved_items.append(str(rel))
+            except Exception as e:
+                log_emit("target", f"  ⚠ Could not preserve {rel}: {e}", "WARN")
+    if preserved_items:
+        log_emit(
+            "target",
+            f"Preserving target data: {', '.join(preserved_items)}",
+            "INFO",
+        )
+    else:
+        log_emit("target", "No target-specific data to preserve", "INFO")
     log_emit("target", "Copying updated code...", "INFO")
     _skip_names = {"vision-rag-backups", ".git", "__pycache__"}
     perm_errors = []
@@ -1157,6 +1201,31 @@ def tgt_import():
             continue
         except Exception:
             continue
+    # ── Restore preserved target data after code copy ───────────
+    restored_items = []
+    for rel in _PRESERVE_RELS:
+        tmp_path = preserve_dir / rel
+        if tmp_path.exists():
+            target_path = tgt / rel
+            try:
+                if tmp_path.is_dir():
+                    if target_path.exists():
+                        shutil.rmtree(target_path)
+                    shutil.copytree(tmp_path, target_path)
+                    restored_items.append(f"{rel}/ (dir)")
+                else:
+                    target_path.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(tmp_path, target_path)
+                    restored_items.append(str(rel))
+            except Exception as e:
+                log_emit("target", f"  ⚠ Could not restore {rel}: {e}", "WARN")
+    preserve_tmp.cleanup()
+    if restored_items:
+        log_emit(
+            "target",
+            f"Restored target data: {', '.join(restored_items)}",
+            "OK",
+        )
     if perm_errors:
         log_emit(
             "target",
@@ -1176,6 +1245,12 @@ def tgt_import():
         ".venv",
         "venv",
         "my-pdfs",
+        "cache",
+    }
+    _skip_files = {
+        Path("pipelines/pipeline_state.json"),
+        Path("pipelines/labels.json"),
+        Path("pipelines/colpali-pipeline/valves.json"),
     }
     _verify_ok = 0
     _verify_fail = 0
@@ -1186,6 +1261,8 @@ def tgt_import():
             continue
         rel = src_f.relative_to(sc)
         if any(p in _skip_dirs for p in rel.parts):
+            continue
+        if rel in _skip_files:
             continue
         tgt_f = tgt / rel
         if not tgt_f.exists():
@@ -1316,6 +1393,37 @@ def tgt_import_sudo(password):
         state.target_steps["import"] = "need_sudo"
         return
     log_emit("target", "✓ Ownership fixed", "OK")
+    _PRESERVE_RELS_SUDO = [
+        Path("pipelines/cache"),
+        Path("pipelines/pipeline_state.json"),
+        Path("pipelines/labels.json"),
+        Path("pipelines/colpali-pipeline/valves.json"),
+    ]
+    preserve_tmp_sudo = tempfile.TemporaryDirectory(prefix="vrag_preserve_")
+    preserve_dir_sudo = Path(preserve_tmp_sudo.name)
+    preserved_items_sudo = []
+    for rel in _PRESERVE_RELS_SUDO:
+        target_path = tgt / rel
+        if target_path.exists():
+            tmp_path = preserve_dir_sudo / rel
+            tmp_path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                if target_path.is_dir():
+                    shutil.copytree(target_path, tmp_path)
+                    preserved_items_sudo.append(f"{rel}/ (dir)")
+                else:
+                    shutil.copy2(target_path, tmp_path)
+                    preserved_items_sudo.append(str(rel))
+            except Exception as e:
+                log_emit("target", f"  ⚠ Could not preserve {rel}: {e}", "WARN")
+    if preserved_items_sudo:
+        log_emit(
+            "target",
+            f"Preserving target data: {', '.join(preserved_items_sudo)}",
+            "INFO",
+        )
+    else:
+        log_emit("target", "No target-specific data to preserve", "INFO")
     log_emit("target", "Copying updated code...", "INFO")
     _skip_names = {"vision-rag-backups", ".git", "__pycache__"}
     for item in sc.iterdir():
@@ -1415,6 +1523,30 @@ def tgt_import_sudo(password):
         except Exception as e:
             log_emit("target", f"  ⚠ Error copying {item.name}: {e}", "WARN")
             continue
+    restored_items_sudo = []
+    for rel in _PRESERVE_RELS_SUDO:
+        tmp_path = preserve_dir_sudo / rel
+        if tmp_path.exists():
+            target_path = tgt / rel
+            try:
+                if tmp_path.is_dir():
+                    if target_path.exists():
+                        shutil.rmtree(target_path)
+                    shutil.copytree(tmp_path, target_path)
+                    restored_items_sudo.append(f"{rel}/ (dir)")
+                else:
+                    target_path.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(tmp_path, target_path)
+                    restored_items_sudo.append(str(rel))
+            except Exception as e:
+                log_emit("target", f"  ⚠ Could not restore {rel}: {e}", "WARN")
+    preserve_tmp_sudo.cleanup()
+    if restored_items_sudo:
+        log_emit(
+            "target",
+            f"Restored target data: {', '.join(restored_items_sudo)}",
+            "OK",
+        )
     log_emit("target", "Verifying all files (SHA256)...", "INFO")
     _skip_dirs = {
         "vision-rag-backups",
@@ -1424,6 +1556,12 @@ def tgt_import_sudo(password):
         ".venv",
         "venv",
         "my-pdfs",
+        "cache",
+    }
+    _skip_files = {
+        Path("pipelines/pipeline_state.json"),
+        Path("pipelines/labels.json"),
+        Path("pipelines/colpali-pipeline/valves.json"),
     }
     _verify_ok = 0
     _verify_fail = 0
@@ -1434,6 +1572,8 @@ def tgt_import_sudo(password):
             continue
         rel = src_f.relative_to(sc)
         if any(p in _skip_dirs for p in rel.parts):
+            continue
+        if rel in _skip_files:
             continue
         tgt_f = tgt / rel
         if not tgt_f.exists():

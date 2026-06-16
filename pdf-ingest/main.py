@@ -25,7 +25,12 @@ app = FastAPI()
 PDF_DIR = pathlib.Path(os.getenv("PDF_DIR", "/app/downloads"))
 STATE_FILE = pathlib.Path(os.getenv("STATE_FILE", "/app/pipelines/pipeline_state.json"))
 LABELS_FILE = pathlib.Path(os.getenv("LABELS_FILE", "/app/pipelines/labels.json"))
-WATCHER_STATE_FILE = pathlib.Path(os.getenv("WATCHER_STATE_FILE", "/app/watcher_state/watcher_state.json"))
+WATCHER_STATE_FILE = pathlib.Path(
+    os.getenv("WATCHER_STATE_FILE", "/app/watcher_state/watcher_state.json")
+)
+IMAGE_CACHE_DIR = pathlib.Path(
+    os.getenv("IMAGE_CACHE_DIR", "/app/pipelines/cache/images")
+)
 PIPELINES_URL = os.getenv("PIPELINES_URL", "http://pipelines:9099")
 PIPELINES_API_KEY = os.getenv("PIPELINES_API_KEY", "0p3n-w3bu!")
 PIPELINE_MODEL = os.getenv("PIPELINE_MODEL", "colpali-pipeline")
@@ -36,10 +41,27 @@ COLLECTION_NAME = os.getenv("COLLECTION_NAME", "my_docs")
 PDF_DIR.mkdir(parents=True, exist_ok=True)
 
 
+def _cleanup_cached_images(filename: str) -> int:
+    """Remove cached page images and thumbnails for a given PDF filename.
+    Returns the number of files removed."""
+    if not IMAGE_CACHE_DIR.exists():
+        return 0
+    stem = pathlib.Path(filename).stem
+    removed = 0
+    for pattern in (f"{stem}_p*.jpg", f"{stem}_p*_thumb.jpg"):
+        for f in IMAGE_CACHE_DIR.glob(pattern):
+            f.unlink()
+            removed += 1
+    if removed:
+        log.info(f"Cleaned up {removed} cached image(s) for {filename}")
+    return removed
+
+
 # ── Labels storage ────────────────────────────────────────────────────
 # labels.json: { "filename.pdf": ["label1", "label2", ...], ... }
 # The filename itself is always an implicit label (added at search time
 # by the pipeline), so it is NOT stored redundantly here.
+
 
 def _load_labels() -> dict:
     if LABELS_FILE.exists():
@@ -93,16 +115,24 @@ def _patch_existing_labels():
             combined = _build_full_labels(filename, user_labels)
             qdrant.set_payload(
                 collection_name=COLLECTION_NAME,
-                payload={"labels": combined, "labels_lower": [l.lower() for l in combined]},
+                payload={
+                    "labels": combined,
+                    "labels_lower": [l.lower() for l in combined],
+                },
                 points=FilterSelector(
                     filter=Filter(
-                        must=[FieldCondition(key="source", match=MatchValue(value=filename))]
+                        must=[
+                            FieldCondition(
+                                key="source", match=MatchValue(value=filename)
+                            )
+                        ]
                     )
                 ),
             )
             log.info(f"Startup: patched labels for {filename}: {combined}")
     except Exception as e:
         log.warning(f"Startup label patch failed (Qdrant may not be ready): {e}")
+
 
 app.mount("/pdfs", StaticFiles(directory=str(PDF_DIR)), name="pdfs")
 
@@ -261,7 +291,9 @@ def get_queue():
         if rel == active_file:
             continue  # already shown in progress bar
         if rel in file_progress:
-            queue.append({"filename": rel, "status": "paused", "resume_page": file_progress[rel]})
+            queue.append(
+                {"filename": rel, "status": "paused", "resume_page": file_progress[rel]}
+            )
         else:
             queue.append({"filename": rel, "status": "queued"})
     return queue
@@ -271,8 +303,14 @@ def _send_pipeline_command(command: str):
     try:
         requests.post(
             f"{PIPELINES_URL}/v1/chat/completions",
-            headers={"Authorization": f"Bearer {PIPELINES_API_KEY}", "Content-Type": "application/json"},
-            json={"model": PIPELINE_MODEL, "messages": [{"role": "user", "content": command}]},
+            headers={
+                "Authorization": f"Bearer {PIPELINES_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": PIPELINE_MODEL,
+                "messages": [{"role": "user", "content": command}],
+            },
             timeout=5,
         )
     except Exception:
@@ -298,6 +336,8 @@ def delete_pdf(filename: str):
     pdf_path = PDF_DIR / filename
     if pdf_path.exists():
         pdf_path.unlink()
+
+    _cleanup_cached_images(filename)
 
     # Remove labels for this file
     all_labels = _load_labels()
@@ -329,7 +369,9 @@ def delete_pdf(filename: str):
             collection_name=COLLECTION_NAME,
             points_selector=FilterSelector(
                 filter=Filter(
-                    must=[FieldCondition(key="source", match=MatchValue(value=filename))]
+                    must=[
+                        FieldCondition(key="source", match=MatchValue(value=filename))
+                    ]
                 )
             ),
         )
@@ -349,7 +391,9 @@ def delete_pdf(filename: str):
                     if wstate[space_key][page_id].get("pdf_filename") == filename:
                         del wstate[space_key][page_id]
                         changed = True
-                        log.info(f"Removed {filename} from watcher_state ({space_key}/{page_id})")
+                        log.info(
+                            f"Removed {filename} from watcher_state ({space_key}/{page_id})"
+                        )
             if changed:
                 tmp = str(WATCHER_STATE_FILE) + ".tmp"
                 with open(tmp, "w") as f:
@@ -362,6 +406,7 @@ def delete_pdf(filename: str):
 
 
 # ── Labels API ────────────────────────────────────────────────────────
+
 
 @app.get("/labels")
 def get_all_labels():
@@ -402,7 +447,9 @@ async def update_file_labels(filename: str, request_body: dict):
             payload={"labels": combined, "labels_lower": [l.lower() for l in combined]},
             points=FilterSelector(
                 filter=Filter(
-                    must=[FieldCondition(key="source", match=MatchValue(value=filename))]
+                    must=[
+                        FieldCondition(key="source", match=MatchValue(value=filename))
+                    ]
                 )
             ),
         )
@@ -433,10 +480,12 @@ async def do_search(payload: dict):
     if not query:
         return JSONResponse({"error": "Query is empty"}, status_code=400)
 
-    body = json.dumps({
-        "model": PIPELINE_MODEL,
-        "messages": [{"role": "user", "content": query}],
-    }).encode()
+    body = json.dumps(
+        {
+            "model": PIPELINE_MODEL,
+            "messages": [{"role": "user", "content": query}],
+        }
+    ).encode()
 
     req = urllib.request.Request(
         f"{PIPELINES_URL}/v1/chat/completions",
@@ -461,7 +510,8 @@ async def do_search(payload: dict):
 @app.get("/", response_class=HTMLResponse)
 @app.get("/ui", response_class=HTMLResponse)
 def ui():
-    return HTMLResponse(content=r"""<!DOCTYPE html>
+    return HTMLResponse(
+        content=r"""<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
@@ -1120,11 +1170,10 @@ def ui():
       <div class="card-title">Search Documents</div>
 
       <div class="search-mode-toggle">
-        <button id="modeAll" class="active" onclick="setSearchMode('all')">🌍 Search All (YOLO)</button>
-        <button id="modeLabels" onclick="setSearchMode('labels')">🏷 Filter by Labels</button>
+        <button id="modeLabels" class="active" onclick="setSearchMode('labels')">🏷 Filter by Labels</button>
       </div>
 
-      <div id="labelFilterArea" style="display:none">
+      <div id="labelFilterArea">
         <div class="label-chips" id="selectedLabels"></div>
         <div style="position:relative">
           <input type="text" id="labelInput" placeholder="Type to find labels…"
@@ -1138,11 +1187,14 @@ def ui():
 
       <div class="search-row">
         <div class="search-input-wrap">
-          <input type="text" id="searchInput" placeholder="What are you looking for?" />
+          <input type="text" id="searchInput" placeholder="What are you looking for?" onkeydown="if(event.key==='Enter')doSearch()" />
         </div>
         <button id="searchBtn" onclick="doSearch()">Search</button>
       </div>
       <div class="search-copied" id="searchCopied"></div>
+      <div style="margin-top:8px; padding:8px 10px; background:var(--surface2); border:1px solid var(--border); border-radius:var(--radius-sm); font-size:12px; line-height:1.5; color:var(--accent-hi);">
+        <b>Search</b> opens Open WebUI with your query auto-submitted. Press <b>Enter</b> or click the button.
+      </div>
     </div>
 
     <!-- Indexing status card -->
@@ -1205,15 +1257,13 @@ def ui():
 
 <script>
   // ── Search card ─────────────────────────────────────────────────────
-  let searchMode = 'all'; // 'all' or 'labels'
-  let selectedSearchLabels = []; // labels currently selected as filters
-  let allKnownLabels = []; // { label, count } fetched from server
-  let acIndex = -1; // active index in autocomplete dropdown
+  let searchMode = 'labels';
+  let selectedSearchLabels = [];
+  let allKnownLabels = [];
+  let acIndex = -1;
 
   function setSearchMode(mode) {
     searchMode = mode;
-    document.getElementById('modeAll').className = mode === 'all' ? 'active' : '';
-    document.getElementById('modeLabels').className = mode === 'labels' ? 'active' : '';
     document.getElementById('labelFilterArea').style.display = mode === 'labels' ? '' : 'none';
     if (mode === 'labels') {
       loadAllKnownLabels();
@@ -1391,126 +1441,21 @@ def ui():
       fullQuery = query;
     }
 
-    // Copy to clipboard and show feedback
+    // Copy to clipboard as fallback and show feedback
     navigator.clipboard.writeText(fullQuery).then(() => {
       document.getElementById('searchCopied').textContent =
-        '✓ Copied to clipboard — paste in Open WebUI chat with @Search';
+        '✓ Search sent to Open WebUI — query also copied to clipboard';
       setTimeout(() => {
         document.getElementById('searchCopied').textContent = '';
       }, 4000);
     }).catch(() => {});
 
-    // Open Open WebUI in a new tab
-    const owUrl = `${window.location.protocol}//${window.location.hostname}:3000`;
+    // Open Open WebUI with query pre-filled and auto-submitted
+    const owUrl = `${window.location.protocol}//${window.location.hostname}:3000/?q=${encodeURIComponent(fullQuery)}`;
     window.open(owUrl, '_blank');
-
-    // Also stream the answer directly in a popup
-    openSearchPopup(fullQuery);
 
     toast(`Query ready: ${fullQuery}`, 'ok');
   }
-
-  // ── Direct search popup ────────────────────────────────────────────
-  function openSearchPopup(fullQuery) {
-    // Remove any existing popup
-    const existing = document.getElementById('searchPopup');
-    if (existing) existing.remove();
-
-    const popup = document.createElement('div');
-    popup.id = 'searchPopup';
-    popup.innerHTML = `
-      <div class="sp-overlay" onclick="closeSearchPopup()"></div>
-      <div class="sp-card">
-        <div class="sp-header">
-          <div class="sp-title">🤖 Search Result</div>
-          <button class="sp-close" onclick="closeSearchPopup()">&times;</button>
-        </div>
-        <div class="sp-query">${fullQuery.replace(/</g,'&lt;')}</div>
-        <div class="sp-body">
-          <div class="sp-loading">Thinking…</div>
-          <div class="sp-answer"></div>
-        </div>
-      </div>
-    `;
-    document.body.appendChild(popup);
-
-    // Add inline styles if not already present
-    if (!document.getElementById('sp-styles')) {
-      const style = document.createElement('style');
-      style.id = 'sp-styles';
-      style.textContent = `
-        #searchPopup { position: fixed; inset: 0; z-index: 200; display: flex; align-items: center; justify-content: center; }
-        .sp-overlay { position: absolute; inset: 0; background: rgba(0,0,0,.6); }
-        .sp-card { position: relative; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); width: 90%; max-width: 700px; max-height: 80vh; display: flex; flex-direction: column; box-shadow: 0 20px 60px rgba(0,0,0,.5); }
-        .sp-header { display: flex; align-items: center; justify-content: space-between; padding: 16px 20px; border-bottom: 1px solid var(--border); flex-shrink: 0; }
-        .sp-title { font-size: 15px; font-weight: 600; }
-        .sp-close { background: none; border: none; color: var(--text-muted); font-size: 22px; cursor: pointer; padding: 0; width: 28px; height: 28px; display: flex; align-items: center; justify-content: center; border-radius: 6px; }
-        .sp-close:hover { background: var(--surface2); color: var(--text); }
-        .sp-query { padding: 10px 20px; font-size: 13px; color: var(--accent-hi); background: var(--accent-bg); border-bottom: 1px solid var(--border); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-        .sp-body { padding: 20px; overflow-y: auto; flex: 1; font-size: 14px; line-height: 1.7; }
-        .sp-loading { color: var(--text-muted); font-style: italic; }
-        .sp-answer { white-space: pre-wrap; }
-        .sp-answer h1, .sp-answer h2, .sp-answer h3 { margin-top: 16px; margin-bottom: 8px; }
-        .sp-answer p { margin-bottom: 10px; }
-        .sp-answer code { background: var(--surface2); padding: 2px 6px; border-radius: 4px; font-family: monospace; font-size: 13px; }
-        .sp-answer pre { background: var(--surface2); padding: 12px; border-radius: var(--radius-sm); overflow-x: auto; }
-        .sp-answer a { color: var(--accent-hi); }
-        .sp-answer table { border-collapse: collapse; width: 100%; margin: 10px 0; }
-        .sp-answer th, .sp-answer td { border: 1px solid var(--border); padding: 6px 10px; text-align: left; }
-        .sp-answer th { background: var(--surface2); }
-      `;
-      document.head.appendChild(style);
-    }
-
-    // Stream the response from our /search endpoint
-    const answerEl = popup.querySelector('.sp-answer');
-    const loadingEl = popup.querySelector('.sp-loading');
-    let buffer = '';
-
-    fetch('/search', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ query: fullQuery }),
-    }).then(async response => {
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
-      loadingEl.style.display = 'none';
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        const chunk = decoder.decode(value, { stream: true });
-        // SSE format: data: {...}
-        for (const line of chunk.split('\n')) {
-          if (!line.startsWith('data: ')) continue;
-          const data = line.slice(6);
-          if (data === '[DONE]') continue;
-          try {
-            const parsed = JSON.parse(data);
-            const content = parsed.choices?.[0]?.delta?.content || '';
-            if (content) {
-              buffer += content;
-              answerEl.textContent = buffer;
-              answerEl.scrollTop = answerEl.scrollHeight;
-            }
-          } catch (_) {}
-        }
-      }
-    }).catch(err => {
-      loadingEl.style.display = 'none';
-      answerEl.textContent = 'Error: ' + err.message;
-    });
-  }
-
-  function closeSearchPopup() {
-    const popup = document.getElementById('searchPopup');
-    if (popup) popup.remove();
-  }
-
-  // Close popup on Escape key
-  document.addEventListener('keydown', e => {
-    if (e.key === 'Escape') closeSearchPopup();
-  });
 
   // ── Label rows (upload form) ──────────────────────────────────────
   function addLabelRow(value = '') {
@@ -1889,7 +1834,10 @@ def ui():
   function refresh() { refreshLabels().then(() => refreshStatus()); refreshQueue(); }
   refresh();
   setInterval(refresh, 3000);
+  loadAllKnownLabels();
 </script>
 </body>
 </html>
-""", headers={"Cache-Control": "no-store"})
+""",
+        headers={"Cache-Control": "no-store"},
+    )
