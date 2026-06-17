@@ -395,51 +395,51 @@ def auto_detect_dok():
 
 # ── Restore script generator ──────────────────────────────────────────────
 def gen_restore():
-    return r"""#!/bin/bash
+    return """#!/bin/bash
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
-info() { echo -e "${{BLUE}}[INFO]${{NC}} $*"; }
-ok() { echo -e "${{GREEN}}[OK]${{NC}} $*"; }
-warn() { echo -e "${{YELLOW}}[WARN]${{NC}} $*"; }
-error() { echo -e "${{RED}}[ERROR]${{NC}} $*"; }
+RED='\\033[0;31m'; GREEN='\\033[0;32m'; YELLOW='\\033[1;33m'; BLUE='\\033[0;34m'; NC='\\033[0m'
+info() { echo -e "${BLUE}[INFO]${NC} $*"; }
+ok() { echo -e "${GREEN}[OK]${NC} $*"; }
+warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
+error() { echo -e "${RED}[ERROR]${NC} $*"; }
 
 echo "========================================"
 echo "  Vision RAG — RESTORE FROM BACKUP"
 echo "========================================"
 read -p "Type 'yes' to continue: " confirm
-if [ "${{confirm}}" != "yes" ]; then echo "Aborted."; exit 0; fi
+if [ "${confirm}" != "yes" ]; then echo "Aborted."; exit 0; fi
 
 PROJECT_DIR=""
-if [ -f "${{SCRIPT_DIR}}/PROJECT_DIR.txt" ]; then PROJECT_DIR=$(cat "${{SCRIPT_DIR}}/PROJECT_DIR.txt"); fi
-if [ -z "${{PROJECT_DIR}}" ] || [ ! -d "${{PROJECT_DIR}}" ]; then read -p "Enter project directory: " PROJECT_DIR; fi
-if [ ! -d "${{PROJECT_DIR}}" ]; then error "Not found"; exit 1; fi
+if [ -f "${SCRIPT_DIR}/PROJECT_DIR.txt" ]; then PROJECT_DIR=$(cat "${SCRIPT_DIR}/PROJECT_DIR.txt"); fi
+if [ -z "${PROJECT_DIR}" ] || [ ! -d "${PROJECT_DIR}" ]; then read -p "Enter project directory: " PROJECT_DIR; fi
+if [ ! -d "${PROJECT_DIR}" ]; then error "Not found"; exit 1; fi
 
 VOLUME_PREFIX=""
-if [ -f "${{SCRIPT_DIR}}/docker/volumes-list.txt" ]; then VOLUME_PREFIX=$(head -n 1 "${{SCRIPT_DIR}}/docker/volumes-list.txt" | sed 's/_hf-cache//'); fi
-if [ -z "${{VOLUME_PREFIX}}" ]; then VOLUME_PREFIX="vision_rag_git"; fi
+if [ -f "${SCRIPT_DIR}/docker/volumes-list.txt" ]; then VOLUME_PREFIX=$(head -n 1 "${SCRIPT_DIR}/docker/volumes-list.txt" | sed 's/_hf-cache//'); fi
+if [ -z "${VOLUME_PREFIX}" ]; then VOLUME_PREFIX="vision_rag_git"; fi
 
-info "Restoring from: ${{SCRIPT_DIR}}"
-info "Project: ${{PROJECT_DIR}}"
-info "Prefix: ${{VOLUME_PREFIX}}"
+info "Restoring from: ${SCRIPT_DIR}"
+info "Project: ${PROJECT_DIR}"
+info "Prefix: ${VOLUME_PREFIX}"
 
 info "[1/4] Stopping containers..."
-cd "${{PROJECT_DIR}}"
+cd "${PROJECT_DIR}"
 docker compose down 2>/dev/null || true
 ok "Stopped"
 
 info ""
 info "[2/4] Restoring volumes..."
-if [ -d "${{SCRIPT_DIR}}/volumes" ]; then
-    for archive in "${{SCRIPT_DIR}}"/volumes/*.tar.gz; do
-        [ -f "${{archive}}" ] || continue
-        suffix=$(basename "${{archive}}" .tar.gz)
-        name="${{VOLUME_PREFIX}}_${{suffix}}"
-        info "  Restoring ${{name}}..."
-        docker volume create "${{name}}" >/dev/null 2>&1 || true
-        docker run --rm -v "${{name}}:/dest" -v "${{archive}}:/source.tar.gz:ro" busybox sh -c "cd /dest && tar xzf /source.tar.gz" 2>/dev/null || \
-        docker run --rm -v "${{name}}:/dest" -v "${{archive}}:/source.tar.gz:ro" alpine sh -c "cd /dest && tar xzf /source.tar.gz" 2>/dev/null || { warn "Failed ${{name}}"; continue; }
-        ok "    ${{name}} restored"
+if [ -d "${SCRIPT_DIR}/volumes" ]; then
+    for archive in "${SCRIPT_DIR}"/volumes/*.tar.gz; do
+        [ -f "${archive}" ] || continue
+        suffix=$(basename "${archive}" .tar.gz)
+        name="${VOLUME_PREFIX}_${suffix}"
+        info "  Restoring ${name}..."
+        docker volume create "${name}" >/dev/null 2>&1 || true
+        docker run --rm -v "${name}:/dest" -v "${archive}:/source.tar.gz:ro" busybox sh -c "cd /dest && tar xzf /source.tar.gz" 2>/dev/null || \\
+        docker run --rm -v "${name}:/dest" -v "${archive}:/source.tar.gz:ro" alpine sh -c "cd /dest && tar xzf /source.tar.gz" 2>/dev/null || { warn "Failed ${name}"; continue; }
+        ok "    ${name} restored"
     done
 else
     warn "No volume backups"
@@ -447,10 +447,10 @@ fi
 
 info ""
 info "[3/4] Restoring code..."
-if [ -d "${{SCRIPT_DIR}}/code" ]; then
+if [ -d "${SCRIPT_DIR}/code" ]; then
     info "  Restoring full project tree..."
-    rsync -rl --delete --no-perms --no-times --chmod=ugo=rwX --exclude='vision-rag-backups' --exclude='my-pdfs' --exclude='.git' "${{SCRIPT_DIR}}/code/" "${{PROJECT_DIR}}/" 2>/dev/null || \
-    cp -rf "${{SCRIPT_DIR}}/code/"* "${{PROJECT_DIR}}/" 2>/dev/null || true
+    rsync -rl --delete --no-perms --no-times --chmod=ugo=rwX --exclude='vision-rag-backups' --exclude='my-pdfs' --exclude='.git' "${SCRIPT_DIR}/code/" "${PROJECT_DIR}/" 2>/dev/null || \\
+    cp -rf "${SCRIPT_DIR}/code/"* "${PROJECT_DIR}/" 2>/dev/null || true
     ok "  Code restored"
 else
     warn "  No code backup found"
@@ -458,7 +458,7 @@ fi
 
 info ""
 info "[4/4] Restarting..."
-cd "${{PROJECT_DIR}}"
+cd "${PROJECT_DIR}"
 docker compose up -d 2>/dev/null || true
 ok "Restarted"
 
@@ -467,7 +467,7 @@ echo "========================================"
 echo "  RESTORE COMPLETE"
 echo "========================================"
 ok "Reverted to backup state."
-echo "Verify: cd ${{PROJECT_DIR}} && docker compose ps && curl http://localhost:8082/status"
+echo "Verify: cd ${PROJECT_DIR} && docker compose ps && curl http://localhost:8082/status"
 """
 
 
