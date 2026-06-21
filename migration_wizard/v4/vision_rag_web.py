@@ -542,6 +542,126 @@ def _docker_save_gzip(img, out_path, timeout=3600, channel="source"):
     return ok, err_msg
 
 
+def _docker_volume_size(vol, timeout=60):
+    try:
+        r = subprocess.run(
+            [
+                "docker",
+                "run",
+                "--rm",
+                "-v",
+                f"{vol}:/source:ro",
+                "busybox",
+                "du",
+                "-sb",
+                "/source",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        if r.returncode == 0:
+            m = re.match(r"(\d+)", r.stdout.strip())
+            if m:
+                return int(m.group(1))
+    except Exception:
+        pass
+    return None
+
+
+def _docker_volume_backup(
+    vol, out_path, channel="target", timeout=86400, src_bytes=None
+):
+    dest_dir = out_path.parent
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    suffix = (
+        out_path.stem.removesuffix(".tar")
+        if out_path.suffix == ".gz"
+        else out_path.stem
+    )
+    last_log = 0.0
+    for tool in ["busybox", "alpine"]:
+        try:
+            if out_path.exists():
+                out_path.unlink()
+        except Exception:
+            pass
+        proc = subprocess.Popen(
+            [
+                "docker",
+                "run",
+                "--rm",
+                "-v",
+                f"{vol}:/source:ro",
+                "-v",
+                f"{dest_dir}:/dest",
+                tool,
+                "tar",
+                "czf",
+                f"/dest/{out_path.name}",
+                "-C",
+                "/source",
+                ".",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        last_log = time.time()
+        start = time.time()
+        last_sz = 0
+        last_progress = time.time()
+        while proc.poll() is None:
+            time.sleep(5)
+            now = time.time()
+            try:
+                sz = out_path.stat().st_size
+            except OSError:
+                sz = 0
+            if sz != last_sz:
+                last_sz = sz
+                last_progress = now
+            if now - last_log >= 15:
+                if src_bytes:
+                    pct = (sz / src_bytes * 100) if src_bytes else 0
+                    log_emit(
+                        channel,
+                        f"    ... {suffix}: {hsize(sz)} / {hsize(src_bytes)} "
+                        f"({pct:.1f}%)",
+                        "INFO",
+                    )
+                else:
+                    log_emit(channel, f"    ... {suffix}: {hsize(sz)} so far", "INFO")
+                last_log = now
+            if now - start >= timeout:
+                log_emit(
+                    channel,
+                    f"    ! Timeout after {int(now - start)}s for {vol}, killing",
+                    "ERROR",
+                )
+                proc.kill()
+                break
+            if now - last_progress >= 1800 and sz > 0:
+                log_emit(
+                    channel,
+                    f"    ! No progress for 30min on {vol} "
+                    f"(stuck at {hsize(sz)}), killing",
+                    "ERROR",
+                )
+                proc.kill()
+                break
+        stderr = (
+            proc.stderr.read().decode(errors="replace").strip() if proc.stderr else ""
+        )
+        if proc.returncode == 0 and out_path.exists() and out_path.stat().st_size > 0:
+            return True, ""
+        log_emit(
+            channel,
+            f"    {tool} failed for {vol}: {stderr or 'tar error'}",
+            "WARN",
+        )
+    return False, "all tar tools failed"
+
+
 def src_disc():
     if not state.proj:
         log_emit(
@@ -942,37 +1062,21 @@ def tgt_backup():
                 continue
             out = bd / "volumes" / f"{suffix}.tar.gz"
             log_emit("target", f"  Backing up {vol}...", "INFO")
-            try:
-                for tool in ["busybox", "alpine"]:
-                    result = subprocess.run(
-                        [
-                            "docker",
-                            "run",
-                            "--rm",
-                            "-v",
-                            f"{vol}:/source:ro",
-                            "-v",
-                            f"{bd / 'volumes'}:/dest",
-                            tool,
-                            "tar",
-                            "czf",
-                            f"/dest/{suffix}.tar.gz",
-                            "-C",
-                            "/source",
-                            ".",
-                        ],
-                        capture_output=True,
-                        text=True,
-                        timeout=2700,
-                    )
-                    if result.returncode == 0 and out.exists():
-                        sz = out.stat().st_size
-                        log_emit("target", f"    ✓ {suffix}.tar.gz ({hsize(sz)})", "OK")
-                        break
-                else:
-                    log_emit("target", f"    ✗ Failed to backup {vol}", "ERROR")
-            except Exception as e:
-                log_emit("target", f"    ✗ {vol}: {e}", "ERROR")
+            src_bytes = _docker_volume_size(vol)
+            if src_bytes:
+                log_emit(
+                    "target",
+                    f"    {vol} source size: {hsize(src_bytes)}",
+                    "INFO",
+                )
+            ok, err = _docker_volume_backup(
+                vol, out, channel="target", src_bytes=src_bytes
+            )
+            if ok:
+                sz = out.stat().st_size
+                log_emit("target", f"    ✓ {suffix}.tar.gz ({hsize(sz)})", "OK")
+            else:
+                log_emit("target", f"    ✗ Failed to backup {vol}: {err}", "ERROR")
         # Code
         log_emit("target", "Backing up project code...", "WARN")
         _IGNORE_DIRS = {
